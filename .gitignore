@@ -21,3 +21,6 @@ backup-wheels
 .codex
 wheels
 artifacts
+.state/
+__pycache__/
+spark.yaml
