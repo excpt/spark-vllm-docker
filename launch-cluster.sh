@@ -952,7 +952,7 @@ copy_script_to_worker() {
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$worker_ip" \
         "docker cp $remote_tmp $container:$CONTAINER_EXEC_SCRIPT && \
          docker exec -w / $container chmod +x $CONTAINER_EXEC_SCRIPT && \
-        "docker cp $remote_tmp $container:/tmp/exec-script.sh && \
+         docker cp $remote_tmp $container:/tmp/exec-script.sh && \
          docker exec $container chmod +x /tmp/exec-script.sh && \
          rm -f $remote_tmp" || { echo "Error: docker cp to worker $worker_ip failed"; exit 1; }
 }
@@ -1123,6 +1123,21 @@ start_cluster() {
 run_remote_solo() {
     local node="$1"
 
+    # Host-side mount paths (DOCKER_ARGS, CACHE_DIRS_TO_CREATE) were built from the CONTROLLER's
+    # $HOME. On a remote node the home dir can differ (macOS /Users/x vs Linux /home/x), so the
+    # bind-mount SOURCE must be remapped to the remote home — else docker auto-creates empty dirs
+    # on the target and the HF cache / chat-templates vanish.
+    local remote_home; remote_home=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" 'echo $HOME')
+    local docker_args_remote="$DOCKER_ARGS"
+    local cache_dirs_remote=("${CACHE_DIRS_TO_CREATE[@]}")
+    if [[ -n "$remote_home" && "$remote_home" != "$HOME" ]]; then
+        docker_args_remote="${DOCKER_ARGS//$HOME/$remote_home}"
+        local _i
+        for _i in "${!cache_dirs_remote[@]}"; do
+            cache_dirs_remote[$_i]="${cache_dirs_remote[$_i]//$HOME/$remote_home}"
+        done
+    fi
+
     local docker_entrypoint_args=""
     [[ "$KEEP_ENTRYPOINT" != "true" ]] && docker_entrypoint_args="--entrypoint="
 
@@ -1134,7 +1149,7 @@ run_remote_solo() {
         done
     fi
 
-    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS $IMAGE_NAME"
+    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $docker_args_remote $IMAGE_NAME"
     local docker_caps_args docker_resource_args
     if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
         docker_caps_args="--cap-add=IPC_LOCK"
@@ -1145,7 +1160,7 @@ run_remote_solo() {
     fi
 
     echo "Remote-solo: starting container '$CONTAINER_NAME' on $node..."
-    [[ "$MOUNT_CACHE_DIRS" == "true" ]] && ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}" 2>/dev/null
+    [[ "$MOUNT_CACHE_DIRS" == "true" ]] && ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" "mkdir -p ${cache_dirs_remote[*]}" 2>/dev/null
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" \
         "docker rm -f $CONTAINER_NAME >/dev/null 2>&1; docker run $docker_caps_args $docker_resource_args $(get_env_flags "$node") $docker_args_common sleep infinity" \
         || { echo "Error: remote docker run on $node failed"; exit 1; }
