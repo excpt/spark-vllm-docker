@@ -446,9 +446,13 @@ def cmd_apply(args: argparse.Namespace) -> int:
             cmd = " ".join(shlex.quote(p) for p in build_launch(d, port))
             with lock:
                 print(f"[{node}] starting {cname} :{port} ...")
-            if _ssh(master, f"cd {args.remote_dir} && {cmd}").returncode != 0:
+            r = _ssh(master, f"cd {args.remote_dir} && {cmd}")
+            if r.returncode != 0:
+                err = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()
+                tail = "\n        ".join(err[-8:]) if err else "(no output)"
                 with lock:
                     results[cname] = "LAUNCH FAILED"
+                    print(f"[{node}] {cname} LAUNCH FAILED (rc={r.returncode}):\n        {tail}")
                 return  # stop this node's chain; don't pile on a shared GPU
             ok = wait_ready(node, port)
             with lock:
@@ -507,8 +511,11 @@ def cmd_restart(args: argparse.Namespace) -> int:
         _ssh(node, f"docker rm -f {cname} >/dev/null 2>&1")
         cmd = " ".join(shlex.quote(p) for p in build_launch(d, port))
         print(f"[{node}] starting {cname} :{port} ...")
-        if _ssh(master, f"cd {remote_dir} && {cmd}").returncode != 0:
-            print(f"[{node}] LAUNCH FAILED")
+        r = _ssh(master, f"cd {remote_dir} && {cmd}")
+        if r.returncode != 0:
+            err = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()
+            tail = "\n        ".join(err[-8:]) if err else "(no output)"
+            print(f"[{node}] {cname} LAUNCH FAILED (rc={r.returncode}):\n        {tail}")
             return 1
         ok = wait_ready(node, port)
         print(f"[{node}] {cname} -> {'ready' if ok else 'NOT READY (timeout)'}")
