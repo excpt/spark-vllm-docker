@@ -1,0 +1,57 @@
+recipe_version: "1"
+name: Qwen3-Embedding-8B-x86
+description: Qwen3-Embedding-8B text embedder (pooling), x86 discrete-GPU variant. Stock vLLM image, on-the-fly fp8, fractional VRAM. Serves OpenAI /v1/embeddings.
+
+model: Qwen/Qwen3-Embedding-8B
+
+# Stock upstream image (x86_64 + Blackwell). Pre-pull on the node:
+#   docker pull vllm/vllm-openai:latest
+# No build_args / no mods: the --gpu-memory-utilization-gb patch is Spark-only; on a
+# discrete GPU the standard fractional --gpu-memory-utilization works and is accounted.
+container: vllm/vllm-openai:latest
+
+# Embedder runs on a single node (no TP, stateless).
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  # Fraction of the 24GB card. fp8 weights ~7.5GB + CUDA ctx/activation => ~9.6GB @ 0.40.
+  # Co-tenant with rerank(0.40) + ocr(0.10) => 0.90 total. Tune down if init OOMs.
+  # 4k context + 0.37: gives the shared 24GB card ~2GB FREE headroom so OCR (32k, vision) and
+  # the runtime flashinfer workspaces don't OOM. At 16k/0.40 the card packed to ~62MB free and
+  # OCR crashed on an activation alloc. 4k KV is tiny (~0.3GB); embedding chunks fit easily.
+  # 0.36 -> 0.44 (2026-07-21): --enforce-eager was REMOVED (eager silently corrupts some
+  # models on this sm_120 card under vLLM 0.24.0 — it garbled GLM-OCR). Compiled mode adds
+  # torch.compile + cudagraph capture, which the old budget did not cover:
+  #   Estimated CUDA graph memory: 0.28 GiB / Available KV cache memory: 0.16 GiB
+  #   ValueError: 0.28 GiB KV needed for max seq len 4096, available 0.16 GiB
+  # 0.44 => ~10.8 GiB, inside the ~12.4 GiB free once ocr(0.21) + rerank(0.24) are up.
+  gpu_memory_utilization: 0.44
+  max_model_len: 4096
+
+# Pin .33's real NIC (owns 192.168.2.33) + disable IB: launch-cluster injects the MASTER
+# Spark's auto-detected interface (enP7s7) as GLOO/NCCL/TP_SOCKET_IFNAME, which is invalid
+# here and kills gloo at init. recipe env => `export` in the launch script (wins over -e).
+env:
+  NCCL_SOCKET_IFNAME: enp9s0f0np0
+  GLOO_SOCKET_IFNAME: enp9s0f0np0
+  TP_SOCKET_IFNAME: enp9s0f0np0
+  NCCL_IB_DISABLE: "1"
+  # Reduce CUDA fragmentation — on the packed 24GB card embed OOM'd by ~16MiB on a runtime alloc.
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+# --runner pooling => embeddings endpoint (/v1/embeddings).
+# --quantization fp8 => on-the-fly dynamic fp8 (no pre-quantized checkpoint). bf16 (~16GB)
+# would not co-fit on 24GB. Validate embedding quality vs bf16 before trusting it.
+# MRL: callers can request a smaller dim per request via `dimensions`; no serve-time flag.
+command: |
+  vllm serve Qwen/Qwen3-Embedding-8B \
+    --host {host} --port {port} \
+    --runner pooling \
+    --quantization fp8 \
+    --kv-cache-dtype fp8 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --compilation-config '{{"max_cudagraph_capture_size":128}}' \
+    --trust-remote-code
