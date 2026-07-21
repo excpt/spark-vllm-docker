@@ -1,0 +1,53 @@
+recipe_version: "1"
+name: Qwen3-Reranker-4B-x86
+description: Qwen3-Reranker-4B cross-encoder reranker (pooling/score), x86 discrete-GPU variant. Stock vLLM image, on-the-fly fp8, fractional VRAM. Serves /v1/score & /rerank.
+
+model: Qwen/Qwen3-Reranker-4B
+
+# Stock upstream image (x86_64 + Blackwell). Pre-pull:  docker pull vllm/vllm-openai:latest
+container: vllm/vllm-openai:latest
+
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  # Fraction of 24GB. fp8 weights ~7.5GB + overhead => ~9.6GB @ 0.40. Co-tenant budget 0.90.
+  # 4k context + 0.37: gives the shared 24GB card ~2GB FREE headroom so all three (incl OCR 32k
+  # vision) + the FIXED ~394MiB runtime flashinfer workspaces don't OOM. flashinfer's workspace
+  # does NOT shrink with context — only free VRAM saves it. 4k KV is tiny; rerank pairs are short.
+  # 0.24 -> 0.26 (2026-07-21): --enforce-eager REMOVED (silent corruption risk on this
+  # sm_120 card under vLLM 0.24.0). Compiled mode's cudagraph pool left KV 0.04 GiB short:
+  #   Available KV cache memory: 0.24 GiB / ValueError: 0.28 GiB needed for max seq len 4096
+  # Graph capture is already capped at 128 (0.10 GiB). Card budget: ocr 0.21 + rerank 0.26
+  # + embed 0.44 = 0.91 => ~2.2 GiB free, keeping OCR's flashinfer workspace headroom.
+  gpu_memory_utilization: 0.26
+  max_model_len: 4096
+
+# Pin .33's real NIC (owns 192.168.2.33) + disable IB: launch-cluster injects the MASTER
+# Spark's auto-detected interface (enP7s7) as GLOO/NCCL/TP_SOCKET_IFNAME, which is invalid
+# here and kills gloo at init. recipe env => `export` in the launch script (wins over -e).
+env:
+  NCCL_SOCKET_IFNAME: enp9s0f0np0
+  GLOO_SOCKET_IFNAME: enp9s0f0np0
+  TP_SOCKET_IFNAME: enp9s0f0np0
+  NCCL_IB_DISABLE: "1"
+
+# Qwen3-Reranker requires vLLM to convert it to a sequence-classification head.
+# --hf-overrides + --chat-template are MANDATORY (see the Spark recipe for the why).
+# The scoring template must be staged on the node's HF cache (mounted to /root/.cache/
+# huggingface in the container), i.e. on .33:
+#   ~/.cache/huggingface/templates/qwen3_reranker.jinja  (from recipes/templates/)
+# --quantization fp8 => on-the-fly dynamic fp8.
+command: |
+  vllm serve Qwen/Qwen3-Reranker-4B \
+    --host {host} --port {port} \
+    --runner pooling \
+    --quantization fp8 \
+    --kv-cache-dtype fp8 \
+    --hf-overrides '{{"architectures": ["Qwen3ForSequenceClassification"], "classifier_from_token": ["no", "yes"], "is_original_qwen3_reranker": true}}' \
+    --chat-template /root/.cache/huggingface/templates/qwen3_reranker.jinja \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --compilation-config '{{"max_cudagraph_capture_size":128}}' \
+    --trust-remote-code
