@@ -331,13 +331,45 @@ def is_serving(node: str, port: int) -> bool:
     return False
 
 
-def wait_ready(node: str, port: int, timeout: int = 600) -> bool:
-    """Block (on the node) until host:port serves /v1/models, or timeout. Sequential start
-    depends on this — never launch the next model until this one finishes profiling."""
-    loop = (f'for i in $(seq 1 {max(1, timeout // 5)}); do '
-            f'curl -sf -m 4 http://localhost:{port}/v1/models >/dev/null 2>&1 && exit 0; '
-            f'sleep 5; done; exit 1')
-    return _ssh(node, loop).returncode == 0
+def wait_ready(node: str, port: int, cname: str = "") -> bool:
+    """Follow the container log while polling /health + /metrics. Sequential start depends
+    on this — never launch the next model until this one finishes profiling.
+
+    There is NO timeout. A slow load is not a failure: compiled mode (no --enforce-eager)
+    can spend minutes in torch.compile and cudagraph capture with the log the only sign of
+    progress. Killing that on a clock reports a lie ("timeout") about a model that was
+    loading fine. Only two things end this wait, and both are real signals:
+
+      - the container is gone      -> vLLM died; the engine crash took the process with it
+      - /health AND /metrics 200   -> fully loaded and serving
+
+    The log streams to the terminal the whole time, so a genuinely stuck load is visible
+    (and interruptible by the operator) instead of being guessed at from the outside.
+    """
+    if not cname:  # no container name (legacy caller): poll the endpoint only
+        loop = (f'while true; do '
+                f'curl -sf -m 4 http://localhost:{port}/v1/models >/dev/null 2>&1 && exit 0; '
+                f'sleep 5; done')
+        return _ssh(node, loop).returncode == 0
+
+    script = (
+        f'docker logs -f --tail 20 {cname} 2>&1 | sed "s/^/[{cname}] /" & LOG=$!; '
+        f'trap "kill $LOG 2>/dev/null" EXIT INT TERM; '
+        f'while true; do '
+        f'docker inspect -f "{{{{.State.Running}}}}" {cname} 2>/dev/null | grep -q true || '
+        f'{{ echo ">>> {cname}: CONTAINER DIED - crashed during load"; exit 1; }}; '
+        # The engine can die WITHOUT the container dying: EngineCore raises (e.g. not enough
+        # KV cache memory), but the APIServer process lingers, so `docker inspect` still says
+        # Running and /health never comes up. Watching only the container spins forever.
+        f'docker logs --tail 400 {cname} 2>&1 | '
+        f'grep -qE "Engine core initialization failed|EngineCore failed to start" && '
+        f'{{ echo ">>> {cname}: ENGINE CRASHED (container still up)"; exit 1; }}; '
+        f'if curl -sf -m 3 -o /dev/null http://localhost:{port}/health && '
+        f'curl -sf -m 3 -o /dev/null http://localhost:{port}/metrics; then '
+        f'echo ">>> {cname}: LOADED (health+metrics 200)"; exit 0; fi; '
+        f'sleep 3; done'
+    )
+    return _ssh(node, script, capture=False).returncode == 0
 
 
 _LOCAL_HOSTS = None
@@ -454,9 +486,9 @@ def cmd_apply(args: argparse.Namespace) -> int:
                     results[cname] = "LAUNCH FAILED"
                     print(f"[{node}] {cname} LAUNCH FAILED (rc={r.returncode}):\n        {tail}")
                 return  # stop this node's chain; don't pile on a shared GPU
-            ok = wait_ready(node, port)
+            ok = wait_ready(node, port, cname)
             with lock:
-                results[cname] = "ready" if ok else "NOT READY (timeout)"
+                results[cname] = "ready" if ok else "CRASHED (container died)"
                 print(f"[{node}] {cname} -> {results[cname]}")
             if not ok:
                 return
@@ -517,8 +549,8 @@ def cmd_restart(args: argparse.Namespace) -> int:
             tail = "\n        ".join(err[-8:]) if err else "(no output)"
             print(f"[{node}] {cname} LAUNCH FAILED (rc={r.returncode}):\n        {tail}")
             return 1
-        ok = wait_ready(node, port)
-        print(f"[{node}] {cname} -> {'ready' if ok else 'NOT READY (timeout)'}")
+        ok = wait_ready(node, port, cname)
+        print(f"[{node}] {cname} -> {'ready' if ok else 'CRASHED (container died)'}")
         return 0 if ok else 1
 
     if not found:
