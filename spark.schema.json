@@ -1,22 +1,30 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "spark.yaml — Fleet Manager Configuration",
+  "title": "spark.yaml \u2014 Fleet Manager Configuration",
   "description": "Declarative fleet + deployment config for spark apply/apply/apply/diff/apply",
   "type": "object",
   "additionalProperties": false,
-  "required": ["fleet", "deployments"],
+  "required": [
+    "fleet",
+    "deployments"
+  ],
   "properties": {
     "version": {
       "description": "Config format version (semantic version).",
       "type": "string",
-      "examples": ["1", "1.0.0"]
+      "examples": [
+        "1",
+        "1.0.0"
+      ]
     },
     "fleet": {
       "description": "List of fleet nodes.",
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["ip"],
+        "required": [
+          "ip"
+        ],
         "properties": {
           "ip": {
             "description": "Node IP address or hostname.",
@@ -26,7 +34,11 @@
           "mem_gb": {
             "description": "Total GPU memory in GB (validation only, not enforced by vLLM).",
             "type": "integer",
-            "examples": [120, 24, 48]
+            "examples": [
+              120,
+              24,
+              48
+            ]
           }
         }
       }
@@ -36,7 +48,11 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["name", "recipe", "port"],
+        "required": [
+          "name",
+          "recipe",
+          "port"
+        ],
         "additionalProperties": false,
         "properties": {
           "name": {
@@ -46,7 +62,10 @@
           "recipe": {
             "description": "Recipe file name in `recipes/` (without `.yaml` suffix).",
             "type": "string",
-            "examples": ["qwen3.6-27b-nvfp4-mtp-vision", "glm-ocr-x86"]
+            "examples": [
+              "qwen3.6-27b-nvfp4-mtp-vision",
+              "glm-ocr-x86"
+            ]
           },
           "node": {
             "description": "Single-node placement (mutually exclusive with `nodes`).",
@@ -76,23 +95,32 @@
           "max_model_len": {
             "description": "Maximum context length (overrides recipe default).",
             "type": "integer",
-            "examples": [32768, 262144]
+            "examples": [
+              32768,
+              262144
+            ]
           },
           "gpu_mem": {
             "description": "GPU memory utilization (fraction for discrete GPUs, GB for Spark).",
-            "type": ["number", "integer"]
+            "type": [
+              "number",
+              "integer"
+            ]
           },
           "kv_cache_gb": {
-            "description": "KV cache size in GB (Phase 2 — future).",
+            "description": "KV cache size in GB (Phase 2 \u2014 future).",
             "type": "integer"
           },
           "kv_dtype": {
-            "description": "KV cache data type (Phase 2 — future).",
+            "description": "KV cache data type (Phase 2 \u2014 future).",
             "type": "string",
-            "enum": ["fp8", "fp16"]
+            "enum": [
+              "fp8",
+              "fp16"
+            ]
           },
           "mtp": {
-            "description": "Enable MTP/speculative decoding (Phase 2 — future).",
+            "description": "Enable MTP/speculative decoding (Phase 2 \u2014 future).",
             "type": "boolean",
             "default": false
           },
@@ -103,8 +131,17 @@
               "type": "string"
             },
             "examples": [
-              ["--enable-prefix-caching", "--no-async-scheduling"]
+              [
+                "--enable-prefix-caching",
+                "--no-async-scheduling"
+              ]
             ]
+          },
+          "master_port": {
+            "type": "integer",
+            "minimum": 1024,
+            "maximum": 65535,
+            "description": "Torch/Ray rendezvous port for a multi-node deployment. Two clusters sharing the same nodes must use different values (default 29501)."
           }
         }
       }

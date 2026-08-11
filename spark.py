@@ -259,7 +259,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
 # Fleet apply (Phase 1) — reconcile spark.yaml -> running containers
 # ---------------------------------------------------------------------------
 
-DEFAULT_REMOTE_DIR = "~/projects/spark-vllm-docker"
+# Default master is THIS machine (localhost) using THIS checkout — apply/restart always
+# read the local recipes + spark.yaml and push them out, never a target node's stale copy.
+DEFAULT_REMOTE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def _sanitize(name: str) -> str:
@@ -312,6 +314,10 @@ def build_launch(dep: dict, port: int) -> list[str]:
         argv += ["--max-model-len", str(dep["max_model_len"])]
     if dep.get("gpu_mem") is not None:
         argv += ["--gpu-mem", str(dep["gpu_mem"])]
+    # Two multi-node clusters on the SAME node pair collide on torch's rendezvous port
+    # (default 29501) — each needs its own. Only meaningful with `nodes:`.
+    if dep.get("master_port") is not None:
+        argv += ["--master-port", str(dep["master_port"])]
     extra = [str(a) for a in dep.get("extra_args", [])]
     if extra:
         argv += ["--"] + extra
@@ -441,7 +447,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     ports = assign_ports(deps)
     execute = args.execute
     # The master runs run-recipe.sh; --node places each container on its target node.
-    master = args.master or (fleet.get("fleet") or [{}])[0].get("ip") or "localhost"
+    master = args.master or "localhost"
 
     # Group by target node: PARALLEL across nodes (independent GPUs), SEQUENTIAL within a
     # node (shared GPU — concurrent profiling would race).
@@ -474,7 +480,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
                     results[cname] = "already serving (skipped)"
                     print(f"[{node}] {cname} already serving — skipped")
                 continue
-            _ssh(node, f"docker rm -f {cname} >/dev/null 2>&1")   # clear stale/crashed
+            for n in nodes_of(d):   # clear stale/crashed — every rank node, not just the API node
+                _ssh(n, f"docker rm -f {cname} >/dev/null 2>&1")
             cmd = " ".join(shlex.quote(p) for p in build_launch(d, port))
             with lock:
                 print(f"[{node}] starting {cname} :{port} ...")
@@ -510,14 +517,22 @@ def cmd_apply(args: argparse.Namespace) -> int:
 def cmd_down(args: argparse.Namespace) -> int:
     fleet = load_fleet(args.file)
     deps = fleet.get("deployments") or []
+    if args.names:   # no names => everything, as before
+        known = {d["name"] for d in deps}
+        if unknown := set(args.names) - known:
+            print(f"Unknown deployment(s): {', '.join(sorted(unknown))}. "
+                  f"Known: {', '.join(sorted(known))}", file=sys.stderr)
+            return 1
+        deps = [d for d in deps if d["name"] in args.names]
     for d in deps:
-        node, cname = nodes_of(d)[0], container_of(d)
+        cname = container_of(d)
         cmd = f"docker rm -f {cname}"
-        if args.execute:
-            print(f"→ removing {cname} on {node}")
-            _ssh(node, cmd, capture=False)
-        else:
-            print(f"[down] ssh {node} {shlex.quote(cmd)}")
+        for node in nodes_of(d):
+            if args.execute:
+                print(f"→ removing {cname} on {node}")
+                _ssh(node, cmd, capture=False)
+            else:
+                print(f"[down] ssh {node} {shlex.quote(cmd)}")
     if not args.execute:
         print("(dry-run — re-run with --execute to stop containers)")
     return 0
@@ -528,7 +543,7 @@ def cmd_restart(args: argparse.Namespace) -> int:
     deps = fleet.get("deployments") or []
     target = args.name
     ports = assign_ports(deps)
-    master = args.master or (fleet.get("fleet") or [{}])[0].get("ip") or "localhost"
+    master = args.master or "localhost"
     remote_dir = args.remote_dir
 
     found = False
@@ -536,11 +551,16 @@ def cmd_restart(args: argparse.Namespace) -> int:
         if d["name"] != target:
             continue
         found = True
-        node, cname = nodes_of(d)[0], container_of(d)
+        dep_nodes = nodes_of(d)
+        node, cname = dep_nodes[0], container_of(d)
         port = ports[d["name"]]
 
         print(f"Restarting {cname} on {node}:{port}")
-        _ssh(node, f"docker rm -f {cname} >/dev/null 2>&1")
+        # Clear EVERY rank's container, not just the master's — a dead TP=2 cluster
+        # leaves the remote rank alive, spinning on the lost TCPStore and holding its
+        # full memory footprint, which then fails the next launch's free-memory gate.
+        for n in dep_nodes:
+            _ssh(n, f"docker rm -f {cname} >/dev/null 2>&1")
         cmd = " ".join(shlex.quote(p) for p in build_launch(d, port))
         print(f"[{node}] starting {cname} :{port} ...")
         r = _ssh(master, f"cd {remote_dir} && {cmd}")
@@ -557,6 +577,59 @@ def cmd_restart(args: argparse.Namespace) -> int:
         print(f"Deployment not found: {target}", file=sys.stderr)
         return 1
     return 0
+
+
+HEAL_GRACE_S = 1200  # a loading model answers nothing for many minutes — don't stomp it
+
+
+def _launching(node: str, cname: str) -> bool:
+    """True if the container exists, is running, and is younger than HEAL_GRACE_S —
+    i.e. almost certainly still loading weights / warming up, not wedged."""
+    probe = ("s=$(docker inspect -f '{{.State.StartedAt}}' " + cname + " 2>/dev/null) && "
+             "[ \"$(docker inspect -f '{{.State.Running}}' " + cname + " 2>/dev/null)\" = true ] && "
+             "echo $(( $(date +%s) - $(date -d \"$s\" +%s) ))")
+    r = _ssh(node, probe)
+    try:
+        return int((r.stdout or "").strip()) < HEAL_GRACE_S
+    except ValueError:
+        return False
+
+
+def cmd_heal(args: argparse.Namespace) -> int:
+    """Relaunch every deployment that stopped serving. Idempotent and launchd/cron-safe:
+    healthy deployments are untouched, young containers are assumed mid-load and left
+    alone, and relaunches run sequentially (the GPUs are shared)."""
+    import time
+    fleet = load_fleet(args.file)
+    deps = fleet.get("deployments") or []
+    ports = assign_ports(deps)
+    master = args.master or "localhost"
+    print(f"— heal @ {time.strftime('%F %T')}")
+    rc = 0
+    for d in deps:
+        dep_nodes, cname = nodes_of(d), container_of(d)
+        api, port = dep_nodes[0], ports[d["name"]]
+        if is_serving(api, port):
+            print(f"[heal] {cname:22} :{port} ok")
+            continue
+        if _launching(api, cname):
+            print(f"[heal] {cname:22} :{port} still loading — leaving it")
+            continue
+        print(f"[heal] {cname:22} :{port} DOWN — relaunching")
+        for n in dep_nodes:   # every rank node — dead clusters leave RAM-holding zombies
+            _ssh(n, f"docker rm -f {cname} >/dev/null 2>&1")
+        cmd = " ".join(shlex.quote(p) for p in build_launch(d, port))
+        r = _ssh(master, f"cd {args.remote_dir} && {cmd}")
+        if r.returncode != 0:
+            err = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()
+            print(f"[heal] {cname} LAUNCH FAILED (rc={r.returncode}): " + " | ".join(err[-3:]))
+            rc = 1
+            continue
+        ok = wait_ready(api, port, cname)
+        print(f"[heal] {cname} -> {'ready' if ok else 'CRASHED (container died)'}")
+        if not ok:
+            rc = 1
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -580,6 +653,8 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("down", help="stop spark.yaml deployments (dry-run unless --execute)")
     d.add_argument("-f", "--file", default="spark.yaml")
     d.add_argument("--execute", action="store_true")
+    d.add_argument("names", nargs="*", metavar="NAME",
+                   help="deployments to stop (default: all in the file)")
     d.set_defaults(func=cmd_down)
 
     r = sub.add_parser("restart", help="restart a specific model by name (always executes)")
@@ -588,6 +663,12 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
     r.add_argument("name", help="deployment name to restart")
     r.set_defaults(func=cmd_restart)
+
+    h = sub.add_parser("heal", help="relaunch any deployment that stopped serving (launchd/cron-safe)")
+    h.add_argument("-f", "--file", default="spark.yaml")
+    h.add_argument("--master", help="control host (default: localhost)")
+    h.add_argument("--remote-dir", default=DEFAULT_REMOTE_DIR)
+    h.set_defaults(func=cmd_heal)
 
     args = p.parse_args(argv)
     return args.func(args)
