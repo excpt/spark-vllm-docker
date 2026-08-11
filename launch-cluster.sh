@@ -593,6 +593,28 @@ if [[ -n "$NODE_TARGET" ]]; then
     fi
 fi
 
+# Master-orchestrated cluster: if THIS machine is not one of the -n nodes (e.g. the Mac
+# that holds the configs), the head is the FIRST node and every step is driven over SSH,
+# exactly as the workers already are. Setting LOCAL_IP *here* matters: detect_local_ip
+# returns early when it is non-empty, which keeps `ip` and `ibdev2netdev` — both
+# Linux-only — off the master's critical path. detect_nodes then computes PEER_NODES as
+# "every node that isn't the head", which is what we want.
+REMOTE_HEAD="false"
+if [[ "$SOLO_MODE" != "true" && -n "$NODES_ARG" ]]; then
+    _myips=" $(hostname -I 2>/dev/null) 127.0.0.1 localhost "
+    _self_node=""
+    IFS=',' read -r -a _probe_nodes <<< "$NODES_ARG"
+    for _ip in "${_probe_nodes[@]}"; do
+        _ip=$(echo "$_ip" | xargs)
+        if [[ "$_myips" == *" $_ip "* ]]; then _self_node="$_ip"; break; fi
+    done
+    if [[ -z "$_self_node" ]]; then
+        REMOTE_HEAD="true"
+        LOCAL_IP="$(echo "${_probe_nodes[0]}" | xargs)"
+        echo "Master is not a fleet node; head $LOCAL_IP will be orchestrated over SSH."
+    fi
+fi
+
 if [[ "$SOLO_MODE" == "true" ]]; then
     # Solo mode: skip network detection and ignore any saved cluster IP.
     # Remote-solo (--node) keeps LOCAL_IP = the target node set above.
@@ -615,11 +637,21 @@ fi
 IFS=',' read -r -a ALL_NODES <<< "$NODES_ARG"
 
 if [[ "$SOLO_MODE" != "true" ]]; then
-    # Detect Head IP (Local IP)
+    # No-op when REMOTE_HEAD already set LOCAL_IP above; detects our own IP otherwise.
     detect_local_ip || exit 1
 fi
 
 HEAD_IP="$LOCAL_IP"
+
+# Run a command "on the head": locally when the master is the head, else over SSH.
+# Mirrors what the worker loop already does for every peer node.
+head_sh() {
+    if [[ "$REMOTE_HEAD" == "true" ]]; then
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$HEAD_IP" "$1"
+    else
+        bash -c "$1"
+    fi
+}
 
 # Verify HEAD_IP is in ALL_NODES
 FOUND_HEAD=false
@@ -1295,9 +1327,11 @@ make_ray_script() {
     if command_needs_ray_backend "$content"; then
         echo "Adding --distributed-executor-backend ray to launch script for Ray mode." >&2
         local tmp; tmp=$(mktemp /tmp/vllm_ray_script_XXXXXX.sh)
-        cp "$script_path" "$tmp"
-        sed -i "$ s/[[:space:]]*\\\\[[:space:]]*$//" "$tmp"
-        sed -i "$ s/$/ --distributed-executor-backend ray/" "$tmp"
+        # awk, not `sed -i "$ s/…/"`: this runs on the MASTER, and macOS BSD sed reads that
+        # GNU form as a backup suffix — it fails, the append silently never happens.
+        awk 'NR > 1 { print prev } { prev = $0 }
+             END { sub(/[[:space:]]*\\[[:space:]]*$/, "", prev)
+                   print prev " --distributed-executor-backend ray" }' "$script_path" > "$tmp"
         chmod +x "$tmp"
         echo "$tmp"
     else
@@ -1314,12 +1348,16 @@ make_node_script() {
     [[ "$node_rank" -gt 0 ]] && extra="$extra --headless"
 
     local tmp; tmp=$(mktemp /tmp/vllm_node_script_XXXXXX.sh)
-    # Remove just the flag and its value (not the whole line), then filter empty/backslash-only lines
+    # Remove just the flag and its value (not the whole line), filter empty/backslash-only
+    # lines, then strip the last line's trailing backslash and append the multi-node args.
+    # awk, not `sed -i "$ s/…/"`: this runs on the MASTER, and macOS BSD sed reads that GNU
+    # form as a backup suffix — it fails, the rank args silently never get appended, and
+    # every rank then boots solo-style ("World size (2) > available GPUs (1)").
     sed -E 's/--distributed-executor-backend(=|[[:space:]]+)[^[:space:]]+//g' "$script_path" | \
-        grep -Ev '^[[:space:]\\]*$' > "$tmp"
-    # Strip trailing backslash from last line before appending multi-node args
-    sed -i "$ s/[[:space:]]*\\\\[[:space:]]*$//" "$tmp"
-    sed -i "$ s/$/ $extra/" "$tmp"
+        grep -Ev '^[[:space:]\\]*$' | \
+        awk -v extra=" $extra" 'NR > 1 { print prev } { prev = $0 }
+             END { sub(/[[:space:]]*\\[[:space:]]*$/, "", prev); print prev extra }' > "$tmp"
+    grep -q -- '--nnodes' "$tmp" || { echo "Error: failed to append multi-node args to launch script" >&2; exit 1; }
     chmod +x "$tmp"
     echo "$tmp"
 }
@@ -1577,7 +1615,23 @@ start_cluster() {
         done
     fi
 
-    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $DOCKER_ARGS"
+    # Mount SOURCES were built from the MASTER's $HOME. When the master is not a fleet node
+    # (Mac: /Users/x vs Linux /home/x) every bind-mount source must be remapped to the nodes'
+    # home, or docker silently creates empty dirs on each node and the HF cache vanishes.
+    # Same remap run_remote_solo does; the nodes share a home path, so one lookup covers both.
+    local _cluster_args="$DOCKER_ARGS"
+    if [[ "$REMOTE_HEAD" == "true" ]]; then
+        local remote_home; remote_home=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$HEAD_IP" 'echo $HOME')
+        if [[ -n "$remote_home" && "$remote_home" != "$HOME" ]]; then
+            _cluster_args="${DOCKER_ARGS//$HOME/$remote_home}"
+            local _i
+            for _i in "${!CACHE_DIRS_TO_CREATE[@]}"; do
+                CACHE_DIRS_TO_CREATE[$_i]="${CACHE_DIRS_TO_CREATE[$_i]//$HOME/$remote_home}"
+            done
+            echo "Remapped mount paths for remote nodes: $HOME -> $remote_home"
+        fi
+    fi
+    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $_cluster_args"
     local docker_caps_args=""
     local docker_resource_args=""
 
@@ -1607,14 +1661,26 @@ start_cluster() {
     # Start Head Node
     echo "Starting Head Node on $HEAD_IP..."
     if [[ "$MOUNT_CACHE_DIRS" == "true" ]]; then
-        for dir in "${CACHE_DIRS_TO_CREATE[@]}"; do
-            mkdir -p "$dir"
-        done
+        if [[ "$REMOTE_HEAD" == "true" ]]; then
+            head_sh "mkdir -p ${CACHE_DIRS_TO_CREATE[*]}"
+        else
+            for dir in "${CACHE_DIRS_TO_CREATE[@]}"; do
+                mkdir -p "$dir"
+            done
+        fi
     fi
-    docker run $docker_caps_args $docker_resource_args \
-        $(get_env_flags "$HEAD_IP") $docker_args_common \
-        "${CONTAINER_ENV_ARGS[@]}" "$IMAGE_NAME" "${keepalive_cmd[@]}" || { cleanup; return 1; }
-    ensure_container_earlyoom "$HEAD_IP" "true" || { cleanup; return 1; }
+    if [[ "$REMOTE_HEAD" == "true" ]]; then
+        # Master is not the head: same quoting as the worker loop below.
+        local head_launch_args
+        printf -v head_launch_args '%q ' "${CONTAINER_ENV_ARGS[@]}" "$IMAGE_NAME" "${keepalive_cmd[@]}"
+        head_sh "docker run $docker_caps_args $docker_resource_args $(get_env_flags "$HEAD_IP") $docker_args_common $head_launch_args" || { cleanup; return 1; }
+        ensure_container_earlyoom "$HEAD_IP" "false" || { cleanup; return 1; }
+    else
+        docker run $docker_caps_args $docker_resource_args \
+            $(get_env_flags "$HEAD_IP") $docker_args_common \
+            "${CONTAINER_ENV_ARGS[@]}" "$IMAGE_NAME" "${keepalive_cmd[@]}" || { cleanup; return 1; }
+        ensure_container_earlyoom "$HEAD_IP" "true" || { cleanup; return 1; }
+    fi
 
     # Start Worker Nodes
     for worker in "${PEER_NODES[@]}"; do
@@ -1633,7 +1699,7 @@ start_cluster() {
     if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
         echo "Applying modifications to cluster nodes..."
         for i in "${!MOD_PATHS[@]}"; do
-            if ! apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "true" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"; then
+            if ! apply_mod_to_container "$HEAD_IP" "$CONTAINER_NAME" "$( [[ "$REMOTE_HEAD" == "true" ]] && echo false || echo true )" "${MOD_PATHS[$i]}" "${MOD_TYPES[$i]}"; then
                 cleanup
                 return 1
             fi
@@ -1655,7 +1721,11 @@ start_cluster() {
         if [[ "$NO_RAY_MODE" == "true" ]]; then
             # Build per-node patched scripts on the host, then copy
             local head_script; head_script=$(make_node_script "$LAUNCH_SCRIPT_PATH" "$total_nodes" "0" "$HEAD_IP")
-            copy_script_to_container "$CONTAINER_NAME" "$head_script" "head node ($HEAD_IP)"
+            if [[ "$REMOTE_HEAD" == "true" ]]; then
+                copy_script_to_worker "$HEAD_IP" "$CONTAINER_NAME" "$head_script"
+            else
+                copy_script_to_container "$CONTAINER_NAME" "$head_script" "head node ($HEAD_IP)"
+            fi
             rm -f "$head_script"
 
             local rank=1
@@ -1674,7 +1744,11 @@ start_cluster() {
                     temp_ray_script="$ray_script"
                 fi
             fi
-            copy_script_to_container "$CONTAINER_NAME" "$ray_script" "head node"
+            if [[ "$REMOTE_HEAD" == "true" ]]; then
+                copy_script_to_worker "$HEAD_IP" "$CONTAINER_NAME" "$ray_script"
+            else
+                copy_script_to_container "$CONTAINER_NAME" "$ray_script" "head node"
+            fi
             [[ -n "$temp_ray_script" ]] && rm -f "$temp_ray_script"
         fi
     fi
@@ -1902,7 +1976,14 @@ exec_no_ray_cluster() {
     fi
 
     echo "Executing command on head node (rank 0): $head_cmd"
-    if [[ "$DAEMON_MODE" == "true" ]]; then
+    if [[ "$REMOTE_HEAD" == "true" ]]; then
+        # Master is not the head — dispatch over SSH, quoted the same way as workers.
+        local head_payload head_remote
+        head_payload="$head_cmd >> /proc/1/fd/1 2>&1"
+        printf -v head_remote 'docker exec -d %q bash -c %q' "$CONTAINER_NAME" "$head_payload"
+        ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$HEAD_IP" "$head_remote"
+        echo "Command dispatched on remote head $HEAD_IP. Container: $CONTAINER_NAME"
+    elif [[ "$DAEMON_MODE" == "true" ]]; then
         _exec_on_head "$head_cmd"
     else
         exec_head_with_workers "$head_cmd"
