@@ -1243,7 +1243,11 @@ Examples:
     # Check if image exists (if not using --setup). For a REMOTE --node target the image
     # lives on that node (e.g. x86 vllm/vllm-openai on a discrete-GPU box), not on the ARM
     # master — check there, else a heterogeneous fleet always trips the build prompt.
-    image_host = None if _node_is_local(args.node) else args.node
+    # Same for a REMOTE cluster (-n a,b) driven from a master that is not itself a node:
+    # the head node holds the image, not the master. Checking locally makes every
+    # Mac-orchestrated cluster launch trip the build prompt and abort on EOF.
+    _image_target = args.node or (args.nodes.split(",")[0].strip() if args.nodes else None)
+    image_host = None if _node_is_local(_image_target) else _image_target
     if not args.dry_run and not args.setup and not check_image_exists(container, image_host):
         print(f"Container image '{container}' not found {'on ' + image_host if image_host else 'locally'}.")
         print()
