@@ -161,10 +161,12 @@ get_recipe_mode() {
 run_recipe_dry_run() {
     local recipe_name="$1"
     local mode="$2"
+    # Explicit "$PYTHON", not the shebang: on Windows the #!/usr/bin/env python3 line
+    # lands on the WindowsApps stub and every dry-run comes back empty.
     if [[ "$mode" == "cluster" ]]; then
-        "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1
+        "$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1
     else
-        "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1
+        "$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1
     fi
 }
 
@@ -172,20 +174,25 @@ run_recipe_dry_run() {
 check_prerequisites() {
     log_test "Checking prerequisites..."
     
-    if ! command -v python3 &> /dev/null; then
+    # Same probe as spark/run-recipe.sh: `command -v python3` is not enough on Windows,
+    # where the WindowsApps python3 stub resolves fine and then refuses to execute.
+    for p in "$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/.venv/Scripts/python.exe" python3 python; do
+        "$p" -c '' 2>/dev/null && { PYTHON=$p; break; }
+    done
+    if [ -z "$PYTHON" ]; then
         log_fail "python3 not found"
         exit 1
     fi
-    
-    # Check Python version
-    python_version=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-    if [[ $(echo "$python_version < 3.10" | bc -l) -eq 1 ]]; then
+
+    # Check Python version — no `bc`, it is absent on plenty of systems (incl. Git Bash)
+    python_version=$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    if ! "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 10))'; then
         log_fail "Python 3.10+ required, found $python_version"
         exit 1
     fi
-    
+
     # Check PyYAML
-    if ! python3 -c "import yaml" 2>/dev/null; then
+    if ! "$PYTHON" -c "import yaml" 2>/dev/null; then
         log_fail "PyYAML not installed"
         exit 1
     fi
@@ -219,7 +226,7 @@ test_launch_cluster_exists() {
 test_list_recipes() {
     log_test "run-recipe.py --list"
     
-    output=$("$PROJECT_DIR/run-recipe.py" --list 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" --list 2>&1)
     
     if [[ $? -eq 0 ]] && echo "$output" | grep -q "Available recipes"; then
         log_pass "--list shows available recipes"
@@ -270,9 +277,9 @@ test_all_recipes_load() {
             fi
             
             if [[ "$cluster_only" == "true" ]]; then
-                output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
+                output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
             else
-                output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1 || true)
+                output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo 2>&1 || true)
             fi
             
             if ! echo "$output" | grep -q "Error:"; then
@@ -363,9 +370,9 @@ test_solo_mode_rejects_backend_flags() {
         return
     fi
 
-    output_no_ray=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --no-ray 2>&1)
+    output_no_ray=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --no-ray 2>&1)
     status_no_ray=$?
-    output_ray=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --ray 2>&1)
+    output_ray=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --ray 2>&1)
     status_ray=$?
 
     no_ray_rejected=false
@@ -396,7 +403,7 @@ test_cluster_mode_defaults_no_ray() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run -n "192.168.1.1,192.168.1.2" 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run -n "192.168.1.1,192.168.1.2" 2>&1)
 
     if ! echo "$output" | grep -q "\-\-distributed-executor-backend"; then
         log_pass "Cluster mode correctly strips --distributed-executor-backend by default"
@@ -416,7 +423,7 @@ test_ray_mode_adds_ray_backend() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" glm-4.7-flash-awq --dry-run -n "192.168.1.1,192.168.1.2" --ray 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" glm-4.7-flash-awq --dry-run -n "192.168.1.1,192.168.1.2" --ray 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
 
     if echo "$output" | grep -q "\-\-distributed-executor-backend ray" && echo "$launch_cmd" | grep -q "\-\-ray"; then
@@ -437,7 +444,7 @@ test_cli_override_port() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --port 9999 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --port 9999 2>&1)
     
     if echo "$output" | grep -q "\-\-port 9999"; then
         log_pass "--port override correctly applied"
@@ -538,7 +545,7 @@ container: test-container
 command: echo "test"
 EOF
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1)
     rm -f "$temp_recipe"
     
     if echo "$output" | grep -q "Warning.*schema version"; then
@@ -561,7 +568,7 @@ container: test-container
 command: echo "test"
 EOF
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1 || true)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1 || true)
     rm -f "$temp_recipe"
     
     if echo "$output" | grep -q "Error.*recipe_version"; then
@@ -586,7 +593,7 @@ cluster_only: true
 command: echo "test"
 EOF
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1 || true)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1 || true)
     exit_code=$?
     rm -f "$temp_recipe"
     
@@ -613,7 +620,7 @@ solo_only: true
 command: echo "test"
 EOF
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
     rm -f "$temp_recipe"
     
     if echo "$output" | grep -q "requires solo mode"; then
@@ -637,7 +644,7 @@ solo_only: true
 command: echo "test"
 EOF
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1 || true)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1 || true)
     rm -f "$temp_recipe"
     
     if ! echo "$output" | grep -q "Error: Recipe"; then
@@ -662,8 +669,8 @@ solo_only: true
 command: echo "test"
 EOF
     
-    output_solo=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1 || true)
-    output_cluster=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
+    output_solo=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run --solo 2>&1 || true)
+    output_cluster=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
     rm -f "$temp_recipe"
     
     if echo "$output_solo" | grep -q "requires cluster mode" && echo "$output_cluster" | grep -q "requires solo mode"; then
@@ -711,7 +718,7 @@ test_launch_cmd_solo_flag() {
 test_launch_cmd_nodes_flag() {
     log_test "Launch command includes -n flag with nodes in cluster mode"
     
-    output=$("$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     
     if echo "$launch_cmd" | grep -q "\-n 10.0.0.1,10.0.0.2"; then
@@ -732,7 +739,7 @@ test_launch_cmd_container_image() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" openai-gpt-oss-120b --dry-run --solo 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" openai-gpt-oss-120b --dry-run --solo 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     
     # Check the container is vllm-node-mxfp4 (from the recipe)
@@ -776,7 +783,7 @@ test_launch_cmd_cli_apply_mod_passthrough() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         --apply-mod mods/use-official-vllm \
         --apply-mod mods/gpu-mem-util-gb 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
@@ -803,7 +810,7 @@ test_launch_cmd_cli_apply_vllm_pr_passthrough() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         --apply-mod mods/use-official-vllm \
         --apply-vllm-pr 12345 \
         --apply-mod mods/gpu-mem-util-gb \
@@ -821,7 +828,7 @@ test_launch_cmd_cli_apply_vllm_pr_passthrough() {
         log_verbose "vLLM cmd: $vllm_cmd"
     fi
 
-    if "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    if "$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         --apply-vllm-pr invalid > /dev/null 2>&1; then
         log_fail "Invalid runtime vLLM PR reference was accepted"
     else
@@ -829,7 +836,7 @@ test_launch_cmd_cli_apply_vllm_pr_passthrough() {
     fi
 
     local pr_url="https://github.com/local-inference-lab/vllm/pull/669"
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         --apply-vllm-pr "${pr_url}/" 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     if echo "$launch_cmd" | grep -Fq -- "--apply-vllm-pr ${pr_url}" \
@@ -851,7 +858,7 @@ test_launch_cmd_daemon_flag() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -d 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -d 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     
     if echo "$launch_cmd" | grep -q "\-d"; then
@@ -872,7 +879,7 @@ test_launch_cmd_nccl_debug() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --nccl-debug INFO 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --nccl-debug INFO 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     
     if echo "$launch_cmd" | grep -q "\-\-nccl-debug INFO"; then
@@ -914,7 +921,7 @@ test_launch_cmd_container_override() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -t my-custom-image 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -t my-custom-image 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     
     if echo "$launch_cmd" | grep -q "\-t my-custom-image"; then
@@ -929,7 +936,7 @@ test_launch_cmd_container_override() {
 test_launch_cmd_no_solo_in_cluster() {
     log_test "Launch command does NOT include --solo in cluster mode"
     
-    output=$("$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     
     if echo "$launch_cmd" | grep -qv "\-\-solo" || ! echo "$launch_cmd" | grep -q "\-\-solo"; then
@@ -950,7 +957,7 @@ test_launch_cmd_env_passthrough() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -e HF_TOKEN=test123 -e MY_VAR=hello 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -e HF_TOKEN=test123 -e MY_VAR=hello 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
     
     if echo "$launch_cmd" | grep -q "\-e HF_TOKEN=test123" && echo "$launch_cmd" | grep -q "\-e MY_VAR=hello"; then
@@ -974,7 +981,7 @@ container: test-image
 env: {}
 command: echo test
 EOF
-    output=$("$PROJECT_DIR/run-recipe.py" "$temp_recipe" --config /dev/null --dry-run --solo 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$temp_recipe" --config /dev/null --dry-run --solo 2>&1)
     rm -f "$temp_recipe"
     launch_cmd=$(extract_launch_cmd "$output")
     
@@ -996,7 +1003,7 @@ test_launch_cmd_publish_passthrough() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         -p 8000:8000 --publish 9000:8000 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
 
@@ -1013,7 +1020,7 @@ test_launch_cmd_publish_passthrough() {
 test_launch_cmd_publish_rejects_cluster() {
     log_test "-p port mappings are rejected in cluster mode"
 
-    output=$("$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" minimax-m2-awq --dry-run \
         -n "10.0.0.1,10.0.0.2" -p 8000:8000 2>&1 || true)
 
     if echo "$output" | grep -q "\-p/--publish port forwarding is only supported in solo mode"; then
@@ -1034,7 +1041,7 @@ test_launch_cmd_volume_passthrough() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         -v /data/models:/models --volume /data/results:/results:ro 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
 
@@ -1080,7 +1087,7 @@ test_launch_cmd_keep_entrypoint_passthrough() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         --keep-entrypoint 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
 
@@ -1102,7 +1109,7 @@ test_launch_cmd_earlyoom_passthrough() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         --earlyoom --earlyoom-args "-M 786432,196608 -s 100 -r 120" 2>&1)
     launch_cmd=$(extract_launch_cmd "$output")
 
@@ -1129,7 +1136,7 @@ test_launch_cmd_earlyoom_rejects_keep_entrypoint() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo \
         --earlyoom --keep-entrypoint 2>&1 || true)
 
     if echo "$output" | grep -q "\-\-earlyoom requires launch-cluster.sh to clear the image entrypoint"; then
@@ -1286,7 +1293,7 @@ verify_cluster_args() {
     fi
     
     # Use fake nodes for cluster mode
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --config /dev/null --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --config /dev/null --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
     vllm_cmd=$(extract_vllm_command "$output")
     
     local all_passed=true
@@ -1326,7 +1333,7 @@ test_readme_gpt_oss_cluster() {
         return
     fi
 
-    output=$("$PROJECT_DIR/run-recipe.py" openai-gpt-oss-120b --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" openai-gpt-oss-120b --dry-run -n "10.0.0.1,10.0.0.2" 2>&1 || true)
 
     if echo "$output" | grep -q "requires solo mode"; then
         log_pass "README match (cluster): openai-gpt-oss-120b rejects cluster mode"
@@ -1353,7 +1360,7 @@ test_readme_glm_flash_cluster() {
     fi
     
     # Even in cluster mode, this model uses tp=1
-    output=$("$PROJECT_DIR/run-recipe.py" glm-4.7-flash-awq --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" glm-4.7-flash-awq --dry-run -n "10.0.0.1,10.0.0.2" 2>&1)
     vllm_cmd=$(extract_vllm_command "$output")
     
     if echo "$vllm_cmd" | grep -qE "(--tensor-parallel-size|-tp) 1"; then
@@ -1379,7 +1386,7 @@ test_extra_args_load_format() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- --load-format safetensors 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- --load-format safetensors 2>&1)
     
     if echo "$output" | grep -q "\-\-load-format safetensors"; then
         log_pass "Extra args: --load-format correctly appended"
@@ -1399,7 +1406,7 @@ test_extra_args_served_model_name() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- --served-model-name custom-api-name 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- --served-model-name custom-api-name 2>&1)
     
     if echo "$output" | grep -q "\-\-served-model-name custom-api-name"; then
         log_pass "Extra args: --served-model-name correctly appended"
@@ -1419,7 +1426,7 @@ test_extra_args_equals_syntax() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- -cc.cudagraph_mode=PIECEWISE 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- -cc.cudagraph_mode=PIECEWISE 2>&1)
     
     if echo "$output" | grep -q "\-cc.cudagraph_mode=PIECEWISE"; then
         log_pass "Extra args: equals syntax correctly appended"
@@ -1439,7 +1446,7 @@ test_extra_args_multiple() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- --load-format auto --enforce-eager --seed 42 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- --load-format auto --enforce-eager --seed 42 2>&1)
     
     local all_found=true
     if ! echo "$output" | grep -q "\-\-load-format auto"; then
@@ -1471,7 +1478,7 @@ test_extra_args_empty() {
     fi
     
     # Should not error with just --
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- 2>&1)
     exit_code=$?
     
     if [[ $exit_code -eq 0 ]] && echo "$output" | grep -q "vllm serve"; then
@@ -1493,7 +1500,7 @@ test_extra_args_duplicate_port_warning() {
     fi
     
     # Pass --port via shorthand AND via extra args - should warn
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --port 8080 -- --port 9999 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --port 8080 -- --port 9999 2>&1)
     
     if echo "$output" | grep -qi "warning.*\-\-port\|duplicate.*port"; then
         log_pass "Extra args: duplicate --port warning shown"
@@ -1514,7 +1521,7 @@ test_extra_args_duplicate_gpu_mem_warning() {
     fi
     
     # Pass --gpu-mem via shorthand AND via extra args - should warn
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --gpu-mem 0.8 -- --gpu-memory-utilization 0.95 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --gpu-mem 0.8 -- --gpu-memory-utilization 0.95 2>&1)
     
     if echo "$output" | grep -qi "warning.*gpu-memory-utilization\|duplicate.*gpu"; then
         log_pass "Extra args: duplicate --gpu-memory-utilization warning shown"
@@ -1535,7 +1542,7 @@ test_extra_args_duplicate_tp_warning() {
     fi
     
     # Pass --tp via shorthand AND via extra args - should warn
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --tp 2 -- --tensor-parallel-size 4 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo --tp 2 -- --tensor-parallel-size 4 2>&1)
     
     if echo "$output" | grep -qi "warning.*tensor-parallel\|duplicate.*tensor"; then
         log_pass "Extra args: duplicate --tensor-parallel-size warning shown"
@@ -1555,7 +1562,7 @@ test_extra_args_ordering() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- --my-custom-arg value 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run --solo -- --my-custom-arg value 2>&1)
     vllm_cmd=$(extract_vllm_command "$output")
     
     # The custom arg should appear and be at the end of the command
@@ -1583,7 +1590,7 @@ test_extra_args_cluster_mode() {
         return
     fi
     
-    output=$("$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" -- --load-format auto 2>&1)
+    output=$("$PYTHON" "$PROJECT_DIR/run-recipe.py" "$recipe_name" --dry-run -n "10.0.0.1,10.0.0.2" -- --load-format auto 2>&1)
     
     if echo "$output" | grep -q "\-\-load-format auto"; then
         log_pass "Extra args: work in cluster mode"
