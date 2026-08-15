@@ -40,6 +40,9 @@ env:
   NCCL_IB_DISABLE: "1"
   # Reduce CUDA fragmentation — on the packed 24GB card embed OOM'd by ~16MiB on a runtime alloc.
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # Weights are cached locally; without this, huggingface_hub's ETag check at EngineCore init
+  # can hang the engine indefinitely on a dead TCP connection (see glm-ocr-x86, 2026-07-29).
+  HF_HUB_OFFLINE: "1"
 
 # --runner pooling => embeddings endpoint (/v1/embeddings).
 # --quantization fp8 => on-the-fly dynamic fp8 (no pre-quantized checkpoint). bf16 (~16GB)
