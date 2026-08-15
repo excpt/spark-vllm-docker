@@ -261,7 +261,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 # Default master is THIS machine (localhost) using THIS checkout — apply/restart always
 # read the local recipes + spark.yaml and push them out, never a target node's stale copy.
-DEFAULT_REMOTE_DIR = os.path.dirname(os.path.abspath(__file__))
+# POSIX form: this string is interpolated into a bash `cd`, and a Windows master's
+# backslashes would be eaten as escapes (C:\Users\x -> C:Usersx). No-op on Linux/macOS.
+DEFAULT_REMOTE_DIR = Path(__file__).resolve().parent.as_posix()
 
 
 def _sanitize(name: str) -> str:
@@ -388,7 +390,11 @@ def _is_local(host: str) -> bool:
         import subprocess as _sp, socket
         ips = {"localhost", "127.0.0.1", ""}
         try:
-            ips.update(_sp.run(["hostname", "-I"], capture_output=True, text=True).stdout.split())
+            # Windows' hostname.exe has no -I and prints OEM-encoded usage text instead,
+            # so ask bash for the addresses and never let the decode raise.
+            argv = ["bash", "-c", "hostname -I"] if os.name == "nt" else ["hostname", "-I"]
+            ips.update(_sp.run(argv, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace").stdout.split())
         except Exception:
             pass
         try:
@@ -402,10 +408,12 @@ def _is_local(host: str) -> bool:
 def _ssh(node: str, remote_cmd: str, capture: bool = True):
     """Run a command on `node` — locally if it's this host, else over SSH."""
     import subprocess
+    # Remote output is UTF-8; a Windows master would otherwise decode it as cp1252 and
+    # blow up the reader threads on the first non-ASCII byte.
+    dec = dict(capture_output=capture, text=True, encoding="utf-8", errors="replace")
     if _is_local(node):
-        return subprocess.run(["bash", "-c", remote_cmd], capture_output=capture, text=True)
-    return subprocess.run(["ssh", "-o", "BatchMode=yes", node, remote_cmd],
-                          capture_output=capture, text=True)
+        return subprocess.run(["bash", "-c", remote_cmd], **dec)
+    return subprocess.run(["ssh", "-o", "BatchMode=yes", node, remote_cmd], **dec)
 
 
 def running_containers(node: str) -> set:
@@ -419,7 +427,7 @@ def load_fleet(path: str) -> dict:
     except ImportError:
         print("PyYAML required: pip install pyyaml", file=sys.stderr)
         raise SystemExit(2)
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -633,6 +641,8 @@ def cmd_heal(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):   # tables use ·/—; cp1252 consoles can't encode them
+        stream.reconfigure(encoding="utf-8", errors="replace")
     p = argparse.ArgumentParser(prog="spark", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)

@@ -3,4 +3,5 @@ build-metadata.yaml
 .DS_STORE
 .state/
 __pycache__/
+.venv/
 spark.yaml
