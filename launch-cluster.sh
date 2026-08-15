@@ -624,7 +624,22 @@ if [[ "$SOLO_MODE" == "true" ]]; then
     echo "Solo mode enabled. Skipping node detection."
 else
     # Perform auto-detection
-    detect_interfaces || exit 1
+    if [[ "$REMOTE_HEAD" == "true" && ( -z "$ETH_IF" || -z "$IB_IF" ) ]]; then
+        # ETH_IF/IB_IF name the HEAD's NICs, and every probe behind them (ibdev2netdev,
+        # ip addr) is node-local Linux tooling. A master that is not a fleet node has
+        # nothing useful to detect on itself — ask the head. autodiscover.sh goes over
+        # stdin so this works even when the head has no checkout of its own.
+        echo "Master is not a fleet node; detecting interfaces on head $LOCAL_IP over SSH."
+        _if_env=$(cat "$(dirname "$0")/autodiscover.sh" - <<'PROBE' | ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$LOCAL_IP" bash -s
+detect_interfaces >&2 || exit 1
+printf 'ETH_IF=%q\nIB_IF=%q\nMESH_MODE=%q\n' "$ETH_IF" "$IB_IF" "$MESH_MODE"
+PROBE
+) || { echo "Error: interface detection failed on head $LOCAL_IP."; exit 1; }
+        eval "$_if_env"
+        echo "  head interfaces: ETH_IF=$ETH_IF IB_IF=$IB_IF MESH_MODE=$MESH_MODE"
+    else
+        detect_interfaces || exit 1
+    fi
     detect_nodes || exit 1
 fi
 
