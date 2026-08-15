@@ -32,6 +32,9 @@ env:
   GLOO_SOCKET_IFNAME: enp9s0f0np0
   TP_SOCKET_IFNAME: enp9s0f0np0
   NCCL_IB_DISABLE: "1"
+  # Weights are cached locally; without this, huggingface_hub's ETag check at EngineCore init
+  # can hang the engine indefinitely on a dead TCP connection (see glm-ocr-x86, 2026-07-29).
+  HF_HUB_OFFLINE: "1"
 
 # Qwen3-Reranker requires vLLM to convert it to a sequence-classification head.
 # --hf-overrides + --chat-template are MANDATORY (see the Spark recipe for the why).
