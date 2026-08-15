@@ -23,4 +23,5 @@ wheels
 artifacts
 .state/
 __pycache__/
+.venv/
 spark.yaml

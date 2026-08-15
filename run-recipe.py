@@ -109,6 +109,23 @@ BUILD_SCRIPT = SCRIPT_DIR / "build-and-copy.sh"
 DOWNLOAD_SCRIPT = SCRIPT_DIR / "hf-download.sh"
 AUTODISCOVER_SCRIPT = SCRIPT_DIR / "autodiscover.sh"
 ENV_FILE = None  # Will be set from CLI argument or default
+
+_WIN_PATH_RE = re.compile(r"([A-Za-z]):[\\/](.*)")
+
+
+def to_posix(p) -> str:
+    """C:\\Users\\x -> /c/Users/x. Git Bash resolves that form everywhere; a native
+    Windows path survives argv but breaks the moment a script interpolates it."""
+    m = _WIN_PATH_RE.fullmatch(str(p))
+    return f"/{m[1].lower()}/{m[2]}".replace("\\", "/") if m else str(p)
+
+
+def bashify(cmd: list[str]) -> list[str]:
+    """Route a shell script through bash on Windows — it cannot exec a .sh directly
+    (WinError 193) — and hand it POSIX paths. No-op on Linux/macOS."""
+    if os.name != "nt":
+        return cmd
+    return ["bash", *(to_posix(a) for a in cmd)]
 DISTRIBUTED_EXECUTOR_RE = re.compile(
     r"--distributed-executor-backend(?:=|\s+)\S+"
 )
@@ -226,7 +243,7 @@ def load_recipe(recipe_path: Path) -> dict[str, Any]:
             print(f"Searched in: {recipe_path}, {RECIPES_DIR}")
             sys.exit(1)
 
-    with open(recipe_path) as f:
+    with open(recipe_path, encoding="utf-8") as f:
         recipe = yaml.safe_load(f)
 
     # Validate required fields
@@ -325,8 +342,12 @@ def _node_is_local(node: str | None) -> bool:
         return True
     local = {"127.0.0.1", "localhost", ""}
     try:
+        # Windows' hostname.exe has no -I; it prints OEM-encoded usage text instead, so
+        # ask bash for the addresses and never let the decode raise.
+        argv = ["bash", "-c", "hostname -I"] if os.name == "nt" else ["hostname", "-I"]
         local.update(
-            subprocess.run(["hostname", "-I"], capture_output=True, text=True).stdout.split()
+            subprocess.run(argv, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace").stdout.split()
         )
     except Exception:
         pass
@@ -420,7 +441,7 @@ def build_image(
     if copy_to:
         print(f"Will copy to: {', '.join(copy_to)}")
 
-    result = subprocess.run(cmd)
+    result = subprocess.run(bashify(cmd))
     return result.returncode == 0
 
 
@@ -458,7 +479,7 @@ def download_model(model: str, copy_to: list[str] | None = None) -> bool:
     if copy_to:
         print(f"Will copy to: {', '.join(copy_to)}")
 
-    result = subprocess.run(cmd)
+    result = subprocess.run(bashify(cmd))
     return result.returncode == 0
 
 
@@ -647,7 +668,7 @@ def load_env_file() -> dict[str, str]:
     """
     env = {}
     if ENV_FILE.exists():
-        with open(ENV_FILE) as f:
+        with open(ENV_FILE, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
@@ -680,13 +701,13 @@ def run_autodiscover() -> dict[str, str] | None:
     # Do NOT set CONFIG_FILE_SET=true — that would cause an error if the file
     # doesn't exist yet (it's the file we're about to create).
     env_vars = os.environ.copy()
-    env_vars["CONFIG_FILE"] = str(ENV_FILE)
+    env_vars["CONFIG_FILE"] = to_posix(ENV_FILE)
     env_vars["FORCE_DISCOVER"] = "true"
     env_vars.pop("CONFIG_FILE_SET", None)
 
     # Run autodiscover interactively so its prompts are shown to the user
     script = f"""
-        source '{AUTODISCOVER_SCRIPT}'
+        source '{to_posix(AUTODISCOVER_SCRIPT)}'
         run_autodiscover
     """
 
@@ -730,6 +751,8 @@ def main():
     Returns:
         Exit code for sys.exit()
     """
+    for stream in (sys.stdout, sys.stderr):   # recipe text uses —/·; cp1252 pipes can't encode it
+        stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Run a model using a YAML recipe",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1509,7 +1532,10 @@ Examples:
         return 0
 
     # Write temporary launch script
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False) as f:
+    # newline="" — Windows text mode would emit CRLF and bash chokes on the \r ($'\r':
+    # command not found). This file is a shell script on every platform.
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False,
+                                     encoding="utf-8", newline="") as f:
         f.write(script_content)
         temp_script = f.name
 
@@ -1617,7 +1643,7 @@ Examples:
         print()
 
         # Execute
-        result = subprocess.run(cmd)
+        result = subprocess.run(bashify(cmd))
         return result.returncode
 
     finally:

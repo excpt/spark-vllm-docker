@@ -8,7 +8,13 @@
 #
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if command -v python3 &>/dev/null; then PYTHON=python3; else PYTHON=python; fi
+# Pick the first interpreter that actually RUNS. `command -v python3` is not enough on
+# Windows: WindowsApps ships a python3 stub that resolves fine and then refuses to execute.
+# A local .venv wins so the fleet manager uses the checkout's deps, not the system's.
+for p in "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/.venv/Scripts/python.exe" python3 python; do
+    "$p" -c '' 2>/dev/null && { PYTHON=$p; break; }
+done
+[ -n "$PYTHON" ] || { echo "Error: no working Python 3 found." >&2; exit 1; }
 
 # spark apply needs PyYAML; install on demand (same as run-recipe.sh).
 if ! "$PYTHON" -c "import yaml" 2>/dev/null; then

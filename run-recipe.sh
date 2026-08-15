@@ -8,12 +8,13 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPE_SCRIPT="$SCRIPT_DIR/run-recipe.py"
 
-# Check for Python 3.10+
-if command -v python3 &>/dev/null; then
-    PYTHON=python3
-elif command -v python &>/dev/null; then
-    PYTHON=python
-else
+# Pick the first interpreter that actually RUNS. `command -v python3` is not enough on
+# Windows: WindowsApps ships a python3 stub that resolves fine and then refuses to execute.
+# A local .venv wins so we use the checkout's deps, not the system's.
+for p in "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/.venv/Scripts/python.exe" python3 python; do
+    "$p" -c '' 2>/dev/null && { PYTHON=$p; break; }
+done
+if [ -z "$PYTHON" ]; then
     echo "Error: Python 3 not found. Please install Python 3.10 or later."
     exit 1
 fi
