@@ -1,6 +1,6 @@
 recipe_version: "1"
 name: Qwen3.8-Flash-Next-FP4-Local-TP2
-description: nvidia/Qwen3.8-Flash-Next-FP4-Local, TP=2 across BOTH Sparks, no EP, B12X engine, MTP-4. Drop-in for the old RadixArk Flash-Next endpoint (same served name, port 8006). UNBENCHMARKED here.
+description: nvidia/Qwen3.8-Flash-Next-FP4-Local, TP=2 across BOTH Sparks, no EP, B12X engine, NO speculative decoding. Drop-in for the old RadixArk Flash-Next endpoint (same served name, port 8006). UNBENCHMARKED here.
 
 # 2026-11-12: upstream eugr recipes/qwen3.8-flash-next-nvfp4-cluster.yaml (upstream/main
 # 6430ce1), unchanged except: port, --served-model-name, HF_HUB_OFFLINE.
@@ -29,7 +29,6 @@ defaults:
   max_model_len: 262144
   max_num_seqs: 16
   max_num_batched_tokens: 4096
-  num_speculative_tokens: 4
   # Upstream's value with PLE tables on the GPU. ~84 GiB/rank => this model owns the pair;
   # it cannot co-host with `general`. No kv byte cap yet: nothing measured to size it from.
   gpu_memory_utilization: 0.7
@@ -55,6 +54,10 @@ env:
 
 # --served-model-name: answers as the previously hosted RadixArk build, so the gateway's
 #   `openai/RadixArk/Qwen3.8-Flash-Next-NVFP4` route needs no change.
+# 2026-11-12: MTP (upstream default: depth 4) REMOVED on request. Under an 8-agent opencode
+#   workload acceptance was 40-60% (2.39 accepted per draft step at 2 streams). Unmeasured
+#   whether no-MTP is faster. To restore, add back to defaults `num_speculative_tokens: 4` and:
+#   --speculative-config '{{"method":"mtp","num_speculative_tokens":{{num_speculative_tokens}}, "draft_tensor_parallel_size": {{tensor_parallel}} }}'
 # No --enable-expert-parallel: plain TP=2 (b12x has no EP path anyway).
 command: |
   vllm serve nvidia/Qwen3.8-Flash-Next-FP4-Local \
@@ -75,7 +78,6 @@ command: |
     --max-model-len {max_model_len} \
     --max-num-seqs {max_num_seqs} \
     --max-num-batched-tokens {max_num_batched_tokens} \
-    --speculative-config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}, "draft_tensor_parallel_size": {tensor_parallel} }}' \
     --gdn-decode-kernel b12x \
     --linear-backend b12x \
     --moe-backend b12x \
