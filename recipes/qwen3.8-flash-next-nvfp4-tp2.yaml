@@ -1,6 +1,6 @@
 recipe_version: "1"
 name: Qwen3.8-Flash-Next-FP4-Local-TP2
-description: nvidia/Qwen3.8-Flash-Next-FP4-Local, TP=2 across BOTH Sparks, no EP, B12X engine, MTP-4. Served under the 27B's name. UNBENCHMARKED here.
+description: nvidia/Qwen3.8-Flash-Next-FP4-Local, TP=2 across BOTH Sparks, no EP, B12X engine, MTP-4. Drop-in for the old RadixArk Flash-Next endpoint (same served name, port 8006). UNBENCHMARKED here.
 
 # 2026-11-12: upstream eugr recipes/qwen3.8-flash-next-nvfp4-cluster.yaml (upstream/main
 # 6430ce1), unchanged except: port, --served-model-name, HF_HUB_OFFLINE.
@@ -19,8 +19,9 @@ build_args:
 cluster_only: true
 
 defaults:
-  # Same default as qwen3.8-27b-nvfp4-tp2; spark.yaml's `reasoning` deployment overrides to 8001.
-  port: 8007
+  # Same endpoint as the previous Flash-Next deployment: the gateway route
+  # `qwen/3.8-flash-next-nvfp4` points at http://192.168.2.30:8006/v1 (head must be .30).
+  port: 8006
   host: 0.0.0.0
   tensor_parallel: 2
   pipeline_parallel: 1
@@ -52,11 +53,12 @@ env:
   VLLM_B12X_MOE_FP4_FORCE_A16: "1"
   B12X_W4A16_A4_PREFILL: "1"
 
-# --served-model-name: answers as the 27B so the gateway's `reasoning` route needs no change.
+# --served-model-name: answers as the previously hosted RadixArk build, so the gateway's
+#   `openai/RadixArk/Qwen3.8-Flash-Next-NVFP4` route needs no change.
 # No --enable-expert-parallel: plain TP=2 (b12x has no EP path anyway).
 command: |
   vllm serve nvidia/Qwen3.8-Flash-Next-FP4-Local \
-    --served-model-name unsloth/Qwen3.8-27B-NVFP4 \
+    --served-model-name RadixArk/Qwen3.8-Flash-Next-NVFP4 \
     --host {host} \
     --port {port} \
     --tensor-parallel-size {tensor_parallel} \
