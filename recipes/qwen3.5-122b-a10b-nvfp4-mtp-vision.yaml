@@ -1,0 +1,73 @@
+recipe_version: "1"
+name: Qwen3.5-122B-A10B-NVFP4-MTP-Vision
+description: Qwen3.5-122B-A10B hybrid MoE, NVFP4 + MTP, VISION ENABLED (images + video). Single Spark TP=1, solo.
+
+# nvidia ModelOpt NVFP4 quant. Verified from config.json:
+#   architectures: Qwen3_5MoeForConditionalGeneration (multimodal)
+#   vision_config + image/video_token_id + vision_start/end_token_id  => images AND video
+#   text_config.mtp_num_hidden_layers = 1                              => MTP head present
+#   hf_quant_config: quant_algo NVFP4 (group_size 16), kv_cache_quant_algo FP8
+# Hybrid MoE: 256 experts (8/tok) + shared expert, linear/mamba attn with full attention
+# every 4th layer, 48 layers, 256k context. A10B = ~10B active of 122B total.
+model: nvidia/Qwen3.5-122B-A10B-NVFP4
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# Solo placement (one Spark). ~78GB weights on disk => nearly fills the node; TP=1, no
+# room for co-tenants. Do NOT co-schedule other models on the same node.
+solo_only: true
+
+# ABSOLUTE memory budget (unified-memory safety). vLLM's NATIVE --kv-cache-memory-bytes
+# (hard byte cap, profiler-bypassed) instead of the fraction-of-total that starves the OS
+# on DGX Spark / GB10's shared 120GB and crashes the HOST. No mod/patch needed.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # HARD byte cap on the KV cache. Total slice = weights(~76G) + eager overhead(~6G) + this.
+  # ~92G slice leaves ~27G for the OS on the 120G node (solo). 10 GiB KV. CONSERVATIVE
+  # calibration value: boot once, read real weights+overhead from `free -g` + the vLLM log,
+  # then raise/lower. --enforce-eager keeps overhead low (no cudagraph capture). Hybrid
+  # model: only 12/48 layers keep full KV, so 256k fits in ~3GB/seq.
+  kv_cache_memory_bytes: 10737418240   # 10 * 1024^3
+  # Startup free-memory GATE + ceiling (NOT KV size — pinned above). vLLM still checks
+  # free >= gpu_memory_utilization * total. 0.80 => 96G ceiling; 122B footprint ~92G, solo
+  # on .30 (free ~114G). Explicit value; not relying on the default 0.92 + empty-node luck.
+  gpu_memory_utilization: 0.80
+  max_model_len: 262144             # 256k, full context (costs nothing at boot; pool-bounded).
+  # Hybrid Mamba model forces attention block_size=4224 (>= mamba page size). vLLM asserts
+  # block_size <= max_num_batched_tokens, so this MUST be >= 4224. 8192 satisfies it.
+  max_num_batched_tokens: 8192
+  max_num_seqs: 32                  # moderate concurrency for memory headroom.
+  num_speculative_tokens: 2
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's CUDA-graph memory ESTIMATOR is buggy on this build (reports negative GiB),
+  # inflating "available KV cache" past the GB cap. Disabling it makes the cap hold.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+# Vision enabled via --limit-mm-per-prompt (images + video). Model ships its own
+# chat_template.jinja, so no template override needed. No fastsafetensors (sharded but
+# kept off to avoid the EngineCore load crash seen on this build).
+command: |
+  vllm serve nvidia/Qwen3.5-122B-A10B-NVFP4 \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --no-async-scheduling \
+    --enforce-eager \
+    --limit-mm-per-prompt '{{"image":8,"video":1}}' \
+    --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

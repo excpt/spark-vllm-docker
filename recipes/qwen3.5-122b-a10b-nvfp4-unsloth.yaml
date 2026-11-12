@@ -1,0 +1,100 @@
+recipe_version: "1"
+name: Qwen3.5-122B-A10B-NVFP4-Unsloth
+description: Unsloth Qwen3.5-122B-A10B NVFP4 + MTP, TEXT-ONLY (--language-model-only). Single Spark TP=1, solo.
+
+# VISION DISABLED via --language-model-only (a flag this model's card documents).
+# With vision enabled the node OOM'd during load: 79 GB of weights + CUDA context +
+# 262k-context activations + the 5 GB bf16 MTP drafter + 10 GiB KV exceeded the 119 GB
+# unified pool (peaked at 116/119 with KV not yet allocated). Dropping the ViT is the
+# cheapest large saving. If it still doesn't fit, cut max_model_len next.
+
+# !! DOWNLOAD IS INCOMPLETE on both Sparks as of 2026-07-19 !!
+#   snapshot 0a6419df has model-00002-of-00002.safetensors (24.0 GB) + model_mtp.safetensors
+#   (5.0 GB), but model-00001-of-00002.safetensors is MISSING (one 0-byte .incomplete blob).
+#   Re-run the download before deploying this recipe.
+#
+# Verified from the on-disk config.json:
+#   architectures: Qwen3_5MoeForConditionalGeneration  (hybrid MoE, 48 layers)
+#   vision_config present                              => images + video
+#   mtp_num_hidden_layers = 1, weights in model_mtp.safetensors => MTP head present
+#   quantization_config: compressed-tensors, MIXED FP8 attention/linear + NVFP4 experts
+# Roughly 30 GB lighter on disk than the nvidia ModelOpt quant (78 GB) once complete.
+model: unsloth/Qwen3.5-122B-A10B-NVFP4
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# Solo placement (one Spark). Do NOT co-schedule other models on the same node.
+solo_only: true
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # HARD byte cap on the KV cache. REAL weights = 79 GB on disk (index total_size), not the
+  # ~60 GB earlier estimated from a partial download. Slice = weights(79) + eager
+  # overhead(~6) + KV(10) = ~95 GB, leaving ~25 GB for the OS on the 120 GB node.
+  # These are the PROVEN values from the nvidia 78 GB NVFP4 quant that ran solo on .30.
+  kv_cache_memory_bytes: 10737418240   # 10 * 1024^3
+  # Startup free-memory GATE + ceiling. 0.80 => 96 GB; footprint ~95 GB, solo on .30.
+  gpu_memory_utilization: 0.80
+  max_model_len: 262144
+  # Hybrid Mamba model forces attention block_size=4224 (>= mamba page size), and vLLM
+  # asserts block_size <= max_num_batched_tokens. MUST stay >= 4224.
+  max_num_batched_tokens: 8192
+  max_num_seqs: 32
+  # MTP DISABLED on this model (2026-07-20). The drafter is a SECOND full Qwen3_5MoeMTP
+  # init (256 experts x 48 layers of module structures) plus a 5 GB bf16 weight file, all
+  # allocated during the same load phase — and 79 GB of weights + that overhead does not
+  # fit the 119 GB unified pool. Repeated OOM-deaths during safetensors load, peaking
+  # 107-116 GB before KV was ever requested. Dropping MTP preserves the full 262k context.
+  # The 27B and 35B keep MTP-4; this model trades speculative decode for fitting at all.
+  num_speculative_tokens: 4   # unused while MTP is disabled
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's CUDA-graph memory ESTIMATOR is buggy on this build (reports negative GiB),
+  # inflating "available KV cache" past the byte cap. Disabling it makes the cap hold.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  # Compile cute-DSL / CUTLASS kernels for GB10. Read by nvidia-cutlass-dsl (4.5.2).
+  CUTE_DSL_ARCH: "sm_121a"
+  HF_HUB_OFFLINE: "1"
+
+# --enforce-eager retained from the working nvidia-quant config (keeps overhead low and
+# avoids the cudagraph path on this hybrid model). No fastsafetensors.
+# NO --moe-backend AND NO draft moe_backend — AUTO-SELECT IS MANDATORY HERE.
+# This quant has THREE MoE types, and ONE global backend cannot cover them:
+#   layers 0-46   mlp.experts.*   -> NVFP4  (group_1)
+#   layer  47     mlp.experts.*   -> FP8    (group_0 pins the last layer higher-precision)
+#   mtp.*         draft head MoE  -> bf16 unquantized ("re:^mtp.*" in ignore)
+# All verified by crash on 2026-07-20:
+#   flashinfer_b12x     -> "not supported for FP8 MoE"           (NVFP4 only)
+#   flashinfer_cutlass  -> NVFP4 ok, bf16 ok, but FP8 layer 47 rejects it:
+#                          "kernel does not support quantization scheme
+#                           QuantKey(f8e4m3fn,static,per_channel) x (dynamic,per_token)"
+#   flashinfer_trtllm   -> "kernel does not support current device cuda" on GB10
+#   marlin              -> the ~2x-slower trap the card explicitly warns against
+# The intersection is EMPTY. Only per-layer auto-selection satisfies all three — which is
+# exactly why THIS card says "let vLLM auto-select the NVFP4 kernel" and gives no flag,
+# unlike the sibling 27B/35B DGX Spark sections.
+# VERIFY at boot that no layer landed on MARLIN.
+command: |
+  vllm serve unsloth/Qwen3.5-122B-A10B-NVFP4 \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --override-generation-config '{{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":1.5,"repetition_penalty":1.0}}' \
+    --trust-remote-code \
+    --no-async-scheduling \
+    --enforce-eager \
+    --language-model-only
