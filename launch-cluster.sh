@@ -606,7 +606,7 @@ if [[ "$SOLO_MODE" != "true" && -n "$NODES_ARG" ]]; then
     IFS=',' read -r -a _probe_nodes <<< "$NODES_ARG"
     for _ip in "${_probe_nodes[@]}"; do
         _ip=$(echo "$_ip" | xargs)
-        if [[ "$_myips" == *" $_ip "* ]]; then _self_node="$_ip"; break; fi
+        if [[ "$_myips" == *" $_ip "* || "$_ip" == "${LOCAL_IP:-}" ]]; then _self_node="$_ip"; break; fi
     done
     if [[ -z "$_self_node" ]]; then
         REMOTE_HEAD="true"
@@ -1536,16 +1536,16 @@ verify_cluster_image_consistency() {
 
     echo "Verifying Docker image consistency across cluster nodes..."
 
+    local inspect_cmd
+    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
+
     local head_image_id
-    if ! head_image_id=$(docker image inspect --format '{{.Id}}' "$IMAGE_NAME" 2>/dev/null) || [[ -z "$head_image_id" ]]; then
+    if ! head_image_id=$(head_sh "$inspect_cmd" 2>/dev/null) || [[ -z "$head_image_id" ]]; then
         echo "Error: Could not inspect image '$IMAGE_NAME' on head node ($HEAD_IP)."
         echo "       Make sure the image exists and is accessible to the current user."
         return 1
     fi
     echo "  [HEAD] $HEAD_IP: $head_image_id"
-
-    local inspect_cmd
-    printf -v inspect_cmd "docker image inspect --format '{{.Id}}' %q" "$IMAGE_NAME"
 
     local worker
     local worker_image_id
@@ -1565,7 +1565,7 @@ verify_cluster_image_consistency() {
                 head_fingerprint_checked=true
                 head_fingerprint=$(
                     set -o pipefail
-                    docker image inspect "$head_image_id" |
+                    head_sh "$(printf 'docker image inspect %q' "$head_image_id")" |
                         python3 "$SCRIPT_DIR/docker/image_identity.py"
                 ) 2>/dev/null || head_fingerprint=""
             fi
@@ -1812,7 +1812,7 @@ run_remote_solo() {
         done
     fi
 
-    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $docker_args_remote $IMAGE_NAME"
+    local docker_args_common="--gpus all -d --rm $docker_network_args --name $CONTAINER_NAME $docker_entrypoint_args $docker_args_remote"
     local docker_caps_args docker_resource_args
     if [[ "$NON_PRIVILEGED_MODE" == "true" ]]; then
         docker_caps_args="--cap-add=IPC_LOCK"
@@ -1822,10 +1822,12 @@ run_remote_solo() {
         docker_resource_args="--ipc=host"
     fi
 
+    local remote_launch_args
+    printf -v remote_launch_args '%q ' "${CONTAINER_ENV_ARGS[@]}" "$IMAGE_NAME" sleep infinity
     echo "Remote-solo: starting container '$CONTAINER_NAME' on $node..."
     [[ "$MOUNT_CACHE_DIRS" == "true" ]] && ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" "mkdir -p ${cache_dirs_remote[*]}" 2>/dev/null
     ssh -o BatchMode=yes -o StrictHostKeyChecking=no "$node" \
-        "docker rm -f $CONTAINER_NAME >/dev/null 2>&1; docker run $docker_caps_args $docker_resource_args $(get_env_flags "$node") $docker_args_common sleep infinity" \
+        "docker rm -f $CONTAINER_NAME >/dev/null 2>&1; docker run $docker_caps_args $docker_resource_args $(get_env_flags "$node") $docker_args_common $remote_launch_args" \
         || { echo "Error: remote docker run on $node failed"; exit 1; }
 
     if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
