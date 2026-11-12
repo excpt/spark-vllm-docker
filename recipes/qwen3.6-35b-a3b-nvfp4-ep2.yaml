@@ -1,0 +1,88 @@
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-Fast-EP2
+description: Unsloth Qwen3.6-35B-A3B NVFP4 with EXPERT parallelism across both Sparks. 566 tok/s @ 64 concurrent — 2.9x the 27B. No MTP.
+
+# Benchmarked 2026-07-26 on vLLM 0.26.1.dev0 (image `vllm-node`).
+# 256 prompts, 4096-in / 512-out, --ignore-eos, 64 concurrent:
+#
+#   TP=1, b12x, no MTP          356.87 tok/s   TPOT 157.1 ms
+#   TP=2, b12x, no MTP          537.89 tok/s   TPOT 103.5 ms   (+1.51x)
+#   TP=2, cutlass, no MTP       541.88 tok/s   TPOT 101.8 ms   (backend swap = noise)
+#   TP=2, cutlass, EP, no MTP   566.23 tok/s   TPOT  98.5 ms   (+4.5% from EP)
+#   TP=2, b12x, MTP-3           526.40 tok/s   TPOT 105.2 ms   (MTP is NEGATIVE here)
+#
+# On real ShareGPT chat traffic this sustained ~980 tok/s — the synthetic figure is
+# suppressed by an 8:1 prefill:decode ratio that real chat doesn't have.
+#
+# WHY EP BEATS TP FOR THIS MoE: moe_intermediate_size is only 512, so TP=2 slices every
+# expert's matrices to 256 wide — narrow, inefficient GEMMs. EP keeps 128 WHOLE experts
+# per rank and pays an all-to-all instead. The fabric has room: RoCE never exceeded 3.1%
+# utilisation, and under 1% during pure decode.
+#
+# WHY NO MTP: only ~3B of 35B parameters are active per token, so there is almost no
+# spare bandwidth for a draft head to exploit. Measured -2% throughput, and it nearly
+# tripled inter-token latency (191 ms vs 71 ms median) because tokens arrive in bursts.
+# It also carries the spec-decode illegal-address risk documented for this fleet.
+model: unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
+
+container: vllm-node
+build_args:
+  - --tf5
+
+# EP requires launching as a cluster: `-n <head>,<worker>`. Must be launched FROM a fleet
+# node — autodiscover.sh needs `ip`, which macOS lacks.
+cluster_only: true
+
+defaults:
+  port: 8004
+  host: 0.0.0.0
+  tensor_parallel: 2
+  # HARD byte cap PER RANK. 12 GiB x 2 = 24 GiB pool ≈ 2.38M tokens — this model's KV is
+  # cheap (~10.8 KB/token) because only 10 of its 40 layers are full-attention.
+  # Sized for CO-HOSTING with the 27B; raise toward 40 GiB if running solo.
+  # 2026-07-29: 16 -> 12 GiB/rank. earlyoom (10%-avail floor) killed the co-host layout
+  # during a vision burst while KV occupancy sat at 2% — 4 GB/node buys host headroom.
+  kv_cache_memory_bytes: 12884901888   # 12 * 1024^3
+  # Startup free-memory gate. 0.40 leaves room for the 27B on the same pair.
+  gpu_memory_utilization: 0.40
+  max_model_len: 262144
+  max_num_batched_tokens: 16384
+  # Admission cap: at most 32 requests decode concurrently; the rest wait in vLLM's
+  # queue rather than being admitted. Capture size below is matched to it.
+  max_num_seqs: 32
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  CUTE_DSL_ARCH: "sm_121a"
+  HF_HUB_OFFLINE: "1"
+  # Warm every gemm shape instead of the "relax" heuristic default. ~1-2 min of extra
+  # startup; keeps JIT out of the hot path. Same setting as the 27B for consistency.
+  VLLM_DEEP_GEMM_WARMUP: "full"
+
+# --moe-backend flashinfer_cutlass: MANDATORY with EP. b12x has no expert-parallel path
+#   and refuses outright: "NvFp4 MoE backend 'FLASHINFER_B12X' does not support the
+#   deployment configuration ... ep_size=2, use_ep=True". Measured level with b12x anyway.
+# --async-scheduling: 0.26 auto-enables it; the base recipe's --no-async-scheduling is stale.
+command: |
+  vllm serve unsloth/Qwen3.6-35B-A3B-NVFP4-Fast \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --enable-expert-parallel \
+    --moe-backend flashinfer_cutlass \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --async-scheduling \
+    --structured-outputs-config.backend xgrammar \
+    --safetensors-load-strategy prefetch \
+    --compilation-config '{{"max_cudagraph_capture_size":32,"cudagraph_num_of_warmups":5}}' \
+    --limit-mm-per-prompt '{{"image":8,"video":1}}'

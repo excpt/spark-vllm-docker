@@ -1,0 +1,135 @@
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-Fast-Unsloth
+description: Unsloth Qwen3.6-35B-A3B "NVFP4-Fast" (vision; MTP disabled). Replacement for RedHatAI/Qwen3.6-35B-A3B-NVFP4. Single Spark TP=1.
+
+# Verified from the on-disk config.json (main ref 1c3f884b, 5 shards, 23.6 GB — complete):
+#   architectures: Qwen3_5MoeForConditionalGeneration  (MoE, 40 layers)
+#   vision_config present                              => images + video
+#   mtp_num_hidden_layers = 1                          => MTP head present
+#   quantization_config: compressed-tensors, MIXED — attention/linear in FP8
+#     (float-quantized, 8-bit, per-token dynamic), expert GEMMs in NVFP4.
+#     That mix is what "Fast" means; card claims 1.79x throughput vs other NVFP4 quants.
+model: unsloth/Qwen3.6-35B-A3B-NVFP4-Fast
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# CO-HOSTED with `reasoning` (27B) on .31 since 2026-07-24 (.30 freed for the Laguna tester).
+# TP=1 => full weights on one node; no expert-parallel needed.
+solo_only: false
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # HARD byte cap on the KV cache. CO-HOST budget: hard ~50 GB slice each so 50 + 50 on the
+  # 120 GB node leaves ~20 GB for activations + host.
+  # 23.6 weights + ~10 overhead + 16 KV = ~50 GB slice.
+  # (Solo history: pool was 58 GiB while alone on .31, 2026-07-20 .. 07-24.)
+  kv_cache_memory_bytes: 17179869184   # 16 * 1024^3
+  # Startup free-memory GATE + ceiling. 0.45 => 54 GB; footprint ~50 GB.
+  gpu_memory_utilization: 0.45
+  max_model_len: 262144
+  # 4096 — NOT 8192. vLLM warns that MTP draft slots squeeze this budget and suggests
+  # raising it, but at 8192 this model died mid-request with
+  #   torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+  # at BOTH MTP-6 and MTP-4, so speculation depth is NOT the trigger. 4096 is the last
+  # configuration that served sustained traffic. Suspected flashinfer_b12x NVFP4 MoE
+  # kernel edge case on sm_121 at larger batched-token budgets (cf. vllm#47365).
+  # Accept the "suboptimal performance" warning; a stable endpoint beats a faster crash.
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+  # MTP 4 — NOT 6. At 6 this model died mid-request on 2026-07-20:
+  #   torch.AcceleratorError: CUDA error: an illegal memory access was encountered
+  # crashing EngineCore during a chat completion. MTP-4 served requests fine on the same
+  # b12x MoE path. Suspected interaction between deeper speculative decoding and the
+  # flashinfer_b12x NVFP4 MoE kernel on sm_121 (cf. vllm-project/vllm#47365, garbage/
+  # crashes with b12x NVFP4 MoE on SM120). The 27B runs MTP-6 safely because it is DENSE
+  # — no MoE layers — so b12x is a no-op there. Do not raise this without re-testing
+  # under sustained load.
+  # MTP 2 (2026-07-20). Depths 6 and 4 BOTH crashed with cudaErrorIllegalAddress; removing
+  # spec-decode entirely (Experiment B) ran 34 min clean through a 128-concurrent /
+  # 128,000-token burst. Depth 2 then proved STABLE: 35 h uptime, 355k drafts, zero crashes.
+  # MTP 3 (2026-07-22). Raised from the proven-stable 2 at operator request. UNTESTED and
+  # ONE STEP TOWARD the depths that crashed (4, 6) — the illegal-address fault on the
+  # flashinfer_b12x NVFP4 MoE path (sm_121) has never been root-caused, only depth-bounded.
+  # WATCH under sustained load: if EngineCore dies with cudaErrorIllegalAddress, drop to 2.
+  # At depth 2 acceptance was excellent (0.84/0.72), so the throughput upside here is modest.
+  num_speculative_tokens: 3
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's CUDA-graph memory ESTIMATOR is buggy on this build (reports negative GiB),
+  # inflating "available KV cache" past the byte cap. Disabling it makes the cap hold.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  # Compile cute-DSL / CUTLASS kernels for GB10. Read by nvidia-cutlass-dsl (4.5.2).
+  CUTE_DSL_ARCH: "sm_121a"
+  HF_HUB_OFFLINE: "1"
+  # DROPPED vs the RedHatAI recipe: VLLM_USE_FLASHINFER_MOE_FP4. That env var no longer
+  # exists in this vLLM build (only VLLM_USE_FLASHINFER_MOE_INT4 remains) — it was a no-op.
+  # The FP4 MoE backend is now selected with --moe-backend; see the note below.
+
+# NO --override-generation-config (removed 2026-07-20). The model's own
+# generation_config.json already ships temperature 1.0 / top_k 20 / top_p 0.95, and vLLM's
+# defaults for min_p / presence_penalty / repetition_penalty are 0.0 / 0.0 / 1.0 — so the
+# flag was redundant. It also carried presence_penalty 1.5, a value taken from the
+# Qwen3.5-122B card (a model since dropped); Qwen3.6 thinking mode wants 0.0. Per-request
+# sampling params override the server default anyway, so set penalties per usecase.
+# SPLIT MoE BACKENDS — main model on b12x (card's DGX Spark instruction), draft head on
+# flashinfer_trtllm. Forcing b12x GLOBALLY fails, verified 2026-07-20:
+#   ValueError: moe_backend='flashinfer_b12x' is not supported for unquantized MoE.
+#   Expected one of ['triton', 'flashinfer_trtllm', 'flashinfer_cutlass', 'aiter'].
+# The main model's experts are NVFP4 (b12x fine), but the MTP DRAFT HEAD keeps its MoE
+# layers UNQUANTIZED (bf16). SpeculativeConfig.moe_backend exists for exactly this — vLLM
+# docstring: "Useful when the drafter and generator require different MoE kernels (e.g.
+# quantized generator with unquantized drafter)."
+# Draft head is flashinfer_cutlass, NOT trtllm — verified 2026-07-20:
+#   ValueError: Unquantized MoE backend FlashInfer TRTLLM does not support the deployment
+#   configuration since kernel does not support current device cuda.
+# trtllm has no unquantized-MoE kernel for sm_121 (GB10); aiter is ROCm-only. That leaves
+# flashinfer_cutlass (card-approved) or triton (slow fallback) for the bf16 drafter.
+# Baseline for comparison: with NO --moe-backend, auto picked FLASHINFER_CUTLASS for the
+# MAIN model too. Benchmark b12x-main vs that before settling.
+# Card warns: never end up on MARLIN (~2x slower) — verify the boot log.
+command: |
+  vllm serve unsloth/Qwen3.6-35B-A3B-NVFP4-Fast \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --moe-backend flashinfer_b12x \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --no-async-scheduling \
+    --safetensors-load-strategy prefetch \
+    --compilation-config '{{"max_cudagraph_capture_size":128}}' \
+    --limit-mm-per-prompt '{{"image":8,"video":1}}' \
+    --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens},"moe_backend":"flashinfer_cutlass"}}'
+# EXPERIMENT B (2026-07-20) — CONCLUDED, spec-decode was removed and b12x KEPT:
+# ran 34 min clean, incl. a 128-concurrent burst of 128,000 tokens in 166 s
+# (770 tok/s aggregate, 128/128 ok, zero crash signatures). Crash 4 had died at ~14 min
+# under only 4-way concurrency. => flashinfer_b12x is NOT the bug; the spec-decode path is
+# implicated, consistent with the fault surfacing at rejection_sampler.py:273.
+# NOW TESTING MTP depth 2 (shallower than 4 and 6, which both crashed) — see below.
+#
+# ORIGINAL EXPERIMENT B NOTES:
+# Isolating the cudaErrorIllegalAddress. vLLM PR #48536 + FlashInfer PR #3932 are both in
+# the image (verified: B12xMoEWrapper.run accepts input_global_scale) and did NOT fix it —
+# crashed again ~14 min in at MTP-4 / 4096. The fault surfaced at
+# rejection_sampler.py:273 output_token_ids.cpu().numpy(), the first synchronizing D2H
+# call after the spec-decode step; the request was mid-chunked-prefill at
+# num_computed_tokens=6140. b12x and MoE-with-spec-decode have never been separated (the
+# 27B runs MTP-6 fine but is DENSE, so b12x is a no-op there — a confounded control).
+# If this survives sustained load: spec-decode is implicated, not the b12x MoE kernel.
+# If it still crashes: b12x is implicated -> next is Experiment A (drop --moe-backend,
+# let auto-select take FLASHINFER_CUTLASS).
+# TO RESTORE, re-append as the last line (with a trailing \ on limit-mm-per-prompt):
+#   --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens},"moe_backend":"flashinfer_cutlass"}}'

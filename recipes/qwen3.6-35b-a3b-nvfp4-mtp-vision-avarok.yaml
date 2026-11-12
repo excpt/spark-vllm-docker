@@ -1,0 +1,75 @@
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-MTP-Vision-Avarok
+description: Qwen3.6-35B-A3B MoE on the AVAROK image. ⛔ DOES NOT WORK — tokenizer crash. Kept for record.
+
+# ⛔ CONFIRMED BROKEN 2026-07-15. avarok/dgx-vllm-nvfp4-kernel:latest crashes at STARTUP,
+# before loading weights: "ValueError: Tokenizer class TokenizersBackend does not exist or
+# is not currently imported" — a renderer/tokenizer registry bug in avarok's vLLM 0.16.0rc2.
+# No flag fixes it. Use base qwen3.6-35b-a3b-nvfp4-mtp-vision (native-FP4 tf5). See
+# [[avarok-image-incompatible-hybrid-27b]] for the full avarok failure tally.
+
+# === AVAROK VARIANT of qwen3.6-35b-a3b-nvfp4-mtp-vision.yaml ===
+# This is a MoE model (A3B = ~3B active) — the case avarok actually validated (Qwen3-Next-80B
+# MoE+Mamba). avarok's edge is its Marlin MoE-FP4 backend; on GB10 the correct split is
+# dense->FLASHINFER_CUTLASS, MoE->Marlin. So we route MoE through Marlin
+# (VLLM_USE_FLASHINFER_MOE_FP4=0) but DO NOT set VLLM_NVFP4_GEMM_BACKEND=marlin — that flag
+# forces DENSE layers onto Marlin and CRASHED the 27B ("size_n=96 not divisible by 64").
+# See [[avarok-image-incompatible-hybrid-27b]] for the 27B failure.
+#
+# ⚠️ FIRST-BOOT CHECKS (do not trust /health alone):
+#   1. Did it load, or crash on a Marlin repack ("size_n = N not divisible by tile_n_size = 64")?
+#   2. Is OUTPUT COHERENT? (the dense-hybrid 27B loaded but emitted whitespace/gibberish.)
+#   3. MTP acceptance rate in logs > a few %? (27B avarok gave ~4%.)
+#   4. Any "fla/ops ... format mismatch" warnings? (broken Gated-DeltaNet path signal.)
+# If any fail: revert `general` to qwen3.6-35b-a3b-nvfp4-mtp-vision (base native-FP4 tf5).
+
+model: RedHatAI/Qwen3.6-35B-A3B-NVFP4
+
+# Pulled from Docker Hub (ARM64/GB10). NOT built here — no build_args.
+# Ensure present: docker pull avarok/dgx-vllm-nvfp4-kernel:latest
+container: avarok/dgx-vllm-nvfp4-kernel:latest
+
+solo_only: true
+
+# Memory budget — UNCHANGED from the base recipe (do not touch).
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  kv_cache_memory_bytes: 17179869184   # 16 * 1024^3
+  gpu_memory_utilization: 0.45
+  max_model_len: 262144
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+  num_speculative_tokens: 2
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  # avarok's advantage on MoE: route NVFP4 expert GEMMs through Marlin (not FlashInfer).
+  # NOTE: base recipe sets this to "1" (FlashInfer MoE) for the tf5 build; here we set "0"
+  # to actually exercise avarok's Marlin MoE path. Dense layers stay on CUTLASS (no
+  # VLLM_NVFP4_GEMM_BACKEND set) to avoid the 27B dense-Marlin crash.
+  VLLM_USE_FLASHINFER_MOE_FP4: "0"
+
+# Command == base recipe + explicit --enable-chunked-prefill (4096 batch vs 256k context
+# needs it; avarok's vLLM 0.16.0rc2 default may differ, so set it explicitly).
+command: |
+  vllm serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --no-async-scheduling \
+    --limit-mm-per-prompt '{{"image":8,"video":1}}' \
+    --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

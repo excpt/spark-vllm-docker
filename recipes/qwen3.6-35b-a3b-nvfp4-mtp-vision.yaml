@@ -1,0 +1,67 @@
+recipe_version: "1"
+name: Qwen3.6-35B-A3B-NVFP4-MTP-Vision
+description: Qwen3.6-35B-A3B MoE NVFP4 + MTP, VISION ENABLED (images + video), single Spark TP=1.
+
+model: RedHatAI/Qwen3.6-35B-A3B-NVFP4
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# Solo placement (one Spark). TP=1 => full weights on one node; no expert-parallel needed.
+solo_only: true
+
+# ABSOLUTE memory budget (unified-memory safety). Uses vLLM's NATIVE
+# --kv-cache-memory-bytes (hard byte cap on the KV cache, bypasses the profiler),
+# instead of the fraction-of-total that starves the OS on GB10's shared 120GB and
+# crashes the HOST. No mod/patch needed — native since the current build.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # HARD byte cap on the KV cache. Total footprint = weights(~23G) + overhead(~10G) + this.
+  # 16 GiB KV => ~49G slice, under the 50G budget (co-tenant sums to ~100G < 110G node cap).
+  # CONSERVATIVE calibration value: boot once, read real weights+overhead from `free -g` and
+  # the vLLM log, then raise/lower to hit the exact 50G slice. Fails safe (errors) if too big.
+  kv_cache_memory_bytes: 17179869184   # 16 * 1024^3
+  # Startup free-memory GATE + ceiling (NOT KV size — pinned above). vLLM still checks
+  # free >= gpu_memory_utilization * total. 0.45 => 54G ceiling; 35B footprint ~50G.
+  # (Default 0.92 demands 110G free => works only as the 1st model on an empty node.)
+  gpu_memory_utilization: 0.45
+  max_model_len: 262144
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+  num_speculative_tokens: 2
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's CUDA-graph memory ESTIMATOR is buggy on this build (reports negative GiB),
+  # which inflates "available KV cache" and blows past --gpu-memory-utilization-gb.
+  # Disabling it makes the GB cap actually hold. (vLLM suggests this exact var.)
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  # TEST: route NVFP4 expert GEMMs through FlashInfer's CUTLASS FP4 fused-MoE
+  # kernel (compiled for sm_121 in this image). Benchmark vs default backend;
+  # verify output correctness (sm120 kernel-swap minefield) before keeping.
+  VLLM_USE_FLASHINFER_MOE_FP4: "1"
+
+# Differences vs the text-only recipe:
+#   - tensor_parallel 1 (solo) + dropped --enable-expert-parallel (single GPU)
+#   - --limit-mm-per-prompt now ALLOWS images/video instead of 0/0
+command: |
+  vllm serve RedHatAI/Qwen3.6-35B-A3B-NVFP4 \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --no-async-scheduling \
+    --limit-mm-per-prompt '{{"image":8,"video":1}}' \
+    --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
