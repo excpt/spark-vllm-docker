@@ -1,0 +1,140 @@
+recipe_version: "1"
+name: Qwen3.8-27B-NVFP4-Unsloth-TP2
+description: Unsloth Qwen3.8-27B NVFP4 + MTP-3, sharded TP=2 across BOTH Sparks. Straight model swap of the proven 3.6-27B TP=2 config — UNBENCHMARKED on 3.8.
+
+# 2026-08-15: copied verbatim from qwen3.6-27b-nvfp4-tp2.yaml, model id swapped.
+# NOTHING BELOW HAS BEEN RE-MEASURED ON 3.8 — every number is the 3.6 result. The
+# config is carried over because the two checkpoints are architecturally identical
+# (verified from config.json rev 16b6615a): model_type qwen3_5, 64 layers, hidden
+# 5120, 24 attn / 4 KV heads, head_dim 256, full_attention_interval 4 (=> 16 full-attn
+# layers), GDN 16 key / 48 value heads, intermediate 17408, vocab 248320,
+# mtp_num_hidden_layers 1, 27-block ViT out 5120. Same shapes => same TP=2 divisibility
+# and the same ~37 KB/token KV cost, so the byte caps below transfer.
+# DIFFERENCES from 3.6: single-file checkpoint (model.safetensors 22.57 GB +
+# model_mtp.safetensors 849 MB, index total 23.42 GB — both present on .30 and .31),
+# and quantization_config.format is "mixed-precision" (compressed-tensors 0.17.2.a2026
+# 0716) where 3.6 said "nvfp4-pack-quantized". Re-run the sweep before trusting the
+# MTP-3 ceiling and the 16384/32 batch tuning here.
+#
+# ---- 3.6 MEASUREMENTS (reference only) ----
+# Benchmarked 2026-07-25 on vLLM 0.26.1.dev0+gf2654939e (image `vllm-node`).
+# All numbers below: 256 prompts, 4096-in / 512-out, --ignore-eos, 64 concurrent.
+#
+#   TP=1 solo,  no MTP    109.59 tok/s   TPOT 470.7 ms   TTFT 58.2 s
+#   TP=2,       no MTP    168.67 tok/s   TPOT 307.4 ms   TTFT 37.0 s   (+54%)
+#   TP=2,       MTP-3     197.52 tok/s   TPOT 265.1 ms   TTFT 26.9 s   (+80%)
+#
+# WHY TP=2 WINS: decode is bound by weight bandwidth, not compute or interconnect.
+# GB10 unified memory is ~273 GB/s; sharding halves the bytes each node reads per
+# forward pass. The all-reduce tax is negligible — measured RoCE utilisation never
+# exceeded 3.1% of the 100 GB/s fabric, and only 1.6% during pure decode, because
+# decode all-reduces are KB-scale (batch x 5120 x 2B) and latency-bound, not
+# bandwidth-bound. Four RoCE rails measured identical to two (193.22 vs 197.52).
+#
+# Verified from config.json (main ref 16b6615a, single file + MTP file, 23.42 GB):
+# every sharded dim divides by 2 — attn heads 24->12, KV heads 4->2, GDN key heads
+# 16->8, value heads 48->24, intermediate 17408->8704. The base recipe's "=> TP=1"
+# note is a placement remark (it fits on one node), not an architectural limit.
+model: unsloth/Qwen3.8-27B-NVFP4
+
+container: vllm-node
+build_args:
+  - --tf5
+
+# Multi-node TP: launch with `-n <head>,<worker>`, NOT --node. NCCL rides the RoCE
+# fabric via .env's IB_IF; --eth-if is only NCCL's out-of-band bootstrap channel.
+# NOTE: must be launched FROM a fleet node — autodiscover.sh needs `ip`, which macOS
+# lacks, so Mac-orchestrated multi-node fails at network detection.
+cluster_only: true
+
+defaults:
+  port: 8007
+  host: 0.0.0.0
+  tensor_parallel: 2
+  # HARD byte cap PER RANK, sized for CO-HOSTING with the 35B on the same pair:
+  # 26 GiB x 2 = 52 GiB pool ≈ 1.47M tokens. This model's KV is expensive (~37 KB/token;
+  # 16 of its 64 layers are full-attention, the other 48 are Gated DeltaNet), so it takes
+  # the larger share — the 35B needs only 16 GiB for twice the tokens.
+  # Running SOLO, 64 GiB (68719476736) with gate 0.85 is proven.
+  # DO NOT clear this. Uncapped at 0.85 the profiler took 85.65 GiB/rank; fine at 64
+  # concurrent, but at 512 it drove .30 to 0 GB available and the engine died with a
+  # shm_broadcast TimeoutError — a worker starved of CPU, not a CUDA bug.
+  kv_cache_memory_bytes: 27917287424   # 26 * 1024^3
+  # Startup free-memory GATE. 0.45 leaves room for the 35B to boot after this one.
+  # NOTE: the fraction does NOT bound the process on unified memory — the byte cap above
+  # is what actually holds. At 0.4 with KV uncapped this model took 61 GB, not 48.
+  gpu_memory_utilization: 0.45
+  max_model_len: 262144
+  # 16384 (was 8192): prefill throughput 4106 tok/s vs 1232. This workload is
+  # prefill-dominated (8:1 input:output), so admission rate — not decode — sets the
+  # whole-run number. Pure-decode rate was ~630 tok/s against a 193 tok/s average.
+  max_num_batched_tokens: 16384
+  # Admission cap: at most 32 requests decode concurrently; the rest wait in vLLM's
+  # queue rather than being admitted. Capture size below is matched to it.
+  max_num_seqs: 32
+  # MTP 3 — INHERITED FROM 3.6, not re-tested on 3.8. The 3.8 checkpoint ships the same
+  # single-layer MTP head (model_mtp.safetensors), so depth 3 is the safe starting point;
+  # re-run the depth sweep before assuming the ceiling below still holds.
+  # On 3.6, MTP 3 was the CEILING, on two independent grounds:
+  #   depth 4 is SLOWER where it runs   (c=4: 68.07 tok/s vs 80.13 for depth 3 —
+  #     acceptance length rises 2.87 -> 3.25 but the rate falls 62% -> 56%, and the
+  #     extra flat forward pass costs more than the extra token earns), and
+  #   depth 4 CRASHES otherwise         (CUDA illegal memory access in
+  #     _prepare_inputs/spec_decode_metadata at c=8 and c=64; reproduced with async
+  #     scheduling both on and off, so the scheduler is not implicated).
+  # Acceptance holds up under load: 63.5% / 2.90 at batch 64 vs 63.6% / 2.91 at
+  # batch 16 — depth 3 does NOT decay with concurrency on this model.
+  num_speculative_tokens: 3
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  CUTE_DSL_ARCH: "sm_121a"
+  HF_HUB_OFFLINE: "1"
+  # Warm EVERY gemm shape rather than the "relax" heuristic default (which the docs
+  # describe as giving "no guarantees"). Costs ~1-2 min of extra startup.
+  # KEEP THIS: the one MTP crash on real traffic happened WITHOUT it; ~400 requests
+  # across three runs have been clean WITH it. The eagle spec-decode kernels have no
+  # warmup module of their own (nothing in model_executor/warmup/ covers them), so this
+  # is the closest thing to coverage available — correlation, not a proven fix.
+  VLLM_DEEP_GEMM_WARMUP: "full"
+
+# --async-scheduling: the base recipe's --no-async-scheduling is STALE. vLLM 0.26
+#   defaults async_scheduling to None (auto) and the auto path resolves to True
+#   (config/vllm.py:1090); the only exclusions are pooling models and non-Eagle-family
+#   spec decode. The guard text is explicit that MTP is supported: "only supported with
+#   EAGLE/MTP/Draft Model/NGram GPU/DSpark kind of speculative decoding". Verified
+#   enabled on both ranks in every run below.
+# --structured-outputs-config.backend xgrammar: pins the grammar backend instead of
+#   leaving it 'auto'.
+# --safetensors-load-strategy prefetch: local disk gets a single-threaded loader
+#   otherwise. Nothing is page-cached between launches — vLLM's own ~100 GB allocation
+#   evicts it — so every boot re-reads 21.81 GiB (~8 s at the Spark's ~2.8 GB/s).
+# --compilation-config max_cudagraph_capture_size=32: matches max_num_seqs. Raising
+#   both to 512 gained NOTHING: admission is KV-bound at ~180 concurrent regardless,
+#   and the larger capture cost 2.96 GiB (vs 1.03) plus ~180k tokens of pool.
+# NOT AVAILABLE: --max-num-partial-prefills > 1 raises NotImplementedError
+#   ("Concurrent Partial Prefill is not supported", arg_utils.py:2411), so there is no
+#   knob for the prefill/decode interleaving that produces the ~7 s P99 ITL.
+command: |
+  vllm serve unsloth/Qwen3.8-27B-NVFP4 \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --moe-backend flashinfer_b12x \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --async-scheduling \
+    --structured-outputs-config.backend xgrammar \
+    --safetensors-load-strategy prefetch \
+    --compilation-config '{{"max_cudagraph_capture_size":32,"cudagraph_num_of_warmups":5}}' \
+    --limit-mm-per-prompt '{{"image":8,"video":0}}' \
+    --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

@@ -1,0 +1,68 @@
+recipe_version: "1"
+name: Qwen3.6-27B-NVFP4-MTP-Vision
+description: Qwen3.6-27B dense-hybrid NVFP4 + MTP, VISION ENABLED (images + video), clean base. Single Spark TP=1.
+
+# Clean (non-abliterated) NVFP4 quant with vision tower AND MTP head both preserved in bf16.
+# Verified from config.json: language_model_only=false, vision_config (27-block ViT, out 5120),
+# image/video_token_id set, mtp_num_hidden_layers=1, "re:^mtp\..*" kept out of quant (bf16).
+model: natfii/Qwen3.6-27B-VLM-NVFP4-MTP
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# Solo placement (one Spark). Dense-hybrid (Gated DeltaNet + 16/64 full-attention layers) => TP=1.
+solo_only: true
+
+# ABSOLUTE memory budget (unified-memory safety) — vLLM's NATIVE --kv-cache-memory-bytes
+# (hard byte cap, profiler-bypassed) instead of the fraction-of-total that starves the OS
+# on GB10's shared 120GB. No mod/patch needed — native since the current build.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # HARD byte cap on the KV cache. ~half-the-node slice (like the 35B). natfii weights ~19G
+  # + vision/MTP/activation overhead ~13G => ~24 GiB KV fits a ~56G slice. One full-256K
+  # request needs ~9.13 GiB, so 24 GiB ~= 2.6 concurrent full-256K contexts (many more at
+  # normal lengths). Capped by device-free (~60.8G with general co-resident on .31).
+  kv_cache_memory_bytes: 25769803776   # 24 * 1024^3
+  # Startup free-memory GATE + ceiling. Must be <= device-free-when-co-located (~60.8G with
+  # general up on .31) AND >= actual footprint. 0.48 => 57.4G ceiling/gate: fits the ~56G
+  # slice with ~3.4G margin under the 60.8G device-free. (Default 0.92 demands 110G => crash.)
+  gpu_memory_utilization: 0.48
+  max_model_len: 262144
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+  num_speculative_tokens: 2
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's CUDA-graph memory ESTIMATOR is buggy on this build (reports negative GiB),
+  # inflating "available KV cache" past the GB cap. Disabling it makes the cap hold.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  # Use exactly the on-disk revision; never contact HF / auto-download (avoids the
+  # revision-drift re-download that pulled a wrong model before). Model must be
+  # fully cached (it is: natfii VLM, 20G, complete).
+  HF_HUB_OFFLINE: "1"
+
+# vs the -Text- recipe: vision_config present => --limit-mm-per-prompt ALLOWS images.
+# image:4 conservative (shares node 1 with rerank + ocr). video:0 avoids the boot
+# profiling hang seen on OCR; bump video later if needed.
+command: |
+  vllm serve natfii/Qwen3.6-27B-VLM-NVFP4-MTP \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --no-async-scheduling \
+    --limit-mm-per-prompt '{{"image":4,"video":0}}' \
+    --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

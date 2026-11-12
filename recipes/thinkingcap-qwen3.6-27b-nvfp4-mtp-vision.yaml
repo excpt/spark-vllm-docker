@@ -1,0 +1,68 @@
+recipe_version: "1"
+name: ThinkingCap-Qwen3.6-27B-NVFP4-MTP-Vision
+description: ThinkingCap token-efficient fine-tune of Qwen3.6-27B (~50% fewer thinking tokens), NVFP4 + MTP, VISION ENABLED. Drop-in replacement for the natfii 27B — same port + served name. Single Spark TP=1.
+
+# morosystems NVFP4 quant of bottlecapai/ThinkingCap-Qwen3.6-27B (modelopt 0.45.0, W4A4,
+# group 16). Same architecture + footprint as the natfii quant this replaces:
+# Qwen3_5ForConditionalGeneration, language_model_only=false, 27-block ViT, mtp_num_hidden_layers=1,
+# vision tower + MTP head + lm_head + deltanet projections kept bf16. ~20.6G on disk (natfii ~20G)
+# => the natfii memory budget carries over unchanged.
+model: morosystems/ThinkingCap-Qwen3.6-27B-NVFP4
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# Solo placement (one Spark). Dense-hybrid (Gated DeltaNet + 16/64 full-attention layers) => TP=1.
+solo_only: true
+
+# ABSOLUTE memory budget (unified-memory safety) — identical to qwen3.6-27b-nvfp4-mtp-vision;
+# see that recipe for the derivation. Native --kv-cache-memory-bytes hard cap.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # HARD byte cap on the KV cache: 24 GiB (~2.6 concurrent full-256K contexts).
+  kv_cache_memory_bytes: 25769803776   # 24 * 1024^3
+  # Startup free-memory gate + ceiling: 0.48 => 57.4G, fits the ~56G slice on .31
+  # with general co-resident (~60.8G device-free). Default 0.92 demands 110G => crash.
+  gpu_memory_utilization: 0.48
+  max_model_len: 262144
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+  num_speculative_tokens: 2
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's CUDA-graph memory ESTIMATOR is buggy on this build (reports negative GiB),
+  # inflating "available KV cache" past the GB cap. Disabling it makes the cap hold.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  # Use exactly the on-disk revision; never contact HF / auto-download. Model must be
+  # fully cached on the node before first start (hf download morosystems/ThinkingCap-Qwen3.6-27B-NVFP4).
+  HF_HUB_OFFLINE: "1"
+  # Model card: MTP speculative decoding + guided tool calling triggers FSM crashes
+  # unless strict tool-calling enforcement is off.
+  VLLM_ENFORCE_STRICT_TOOL_CALLING: "0"
+
+# --served-model-name pins the API model id to the OLD natfii path-name so litellm
+# (and every client) needs zero config changes for this in-place swap.
+# image:4 conservative (shares node with general); video:0 avoids the boot profiling hang.
+command: |
+  vllm serve morosystems/ThinkingCap-Qwen3.6-27B-NVFP4 \
+    --host {host} --port {port} \
+    --served-model-name natfii/Qwen3.6-27B-VLM-NVFP4-MTP \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --no-async-scheduling \
+    --limit-mm-per-prompt '{{"image":4,"video":0}}' \
+    --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'

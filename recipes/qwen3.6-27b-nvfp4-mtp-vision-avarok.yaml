@@ -1,0 +1,95 @@
+recipe_version: "1"
+name: Qwen3.6-27B-NVFP4-MTP-Vision-Avarok
+description: Qwen3.6-27B dense-hybrid NVFP4 + MTP on the AVAROK image. ⛔ DOES NOT WORK — see below.
+
+# ⛔⛔⛔ CONFIRMED BROKEN 2026-07-15 — do NOT deploy for this model. Kept for the record.
+# Tested avarok/dgx-vllm-nvfp4-kernel:latest with natfii/Qwen3.6-27B-VLM-NVFP4-MTP:
+#   1. Forcing Marlin (VLLM_NVFP4_GEMM_BACKEND=marlin etc.) → CRASH at load:
+#      "size_n = 96 is not divisible by tile_n_size = 64" (Marlin needs N%64==0; model has a 96-dim).
+#   2. Removing the Marlin env → LOADS + serves, but OUTPUT IS GARBAGE (all-whitespace
+#      completions, health=unhealthy). The avarok build's FLA/Gated-DeltaNet path is broken
+#      for this hybrid model ("Input tensor shape ... format mismatch" warnings on every request).
+# => avarok image cannot correctly serve this hybrid 27B. Use the base recipe
+#    (qwen3.6-27b-nvfp4-mtp-vision, native-FP4 tf5 build) which runs it correctly.
+#    Only revisit avarok for a NON-hybrid, Marlin-compatible (all-dims-%64) NVFP4 quant.
+
+# === AVAROK VARIANT of qwen3.6-27b-nvfp4-mtp-vision.yaml ===
+# Identical model + memory budget to the proven recipe; ONLY the container image and
+# the kernel/backend knobs change. Everything under `defaults:` (vRAM/RAM budget) is
+# byte-for-byte the same as the base recipe — DO NOT tune here. The point of this file
+# is to A/B the avarok NVFP4-kernel image + Marlin MoE path against the local tf5 build.
+#
+# ⚠️ This runs the PROVEN base flag set on the avarok image (torch.compile + sm_121
+# kernels), vLLM DEFAULT NVFP4 backend + DEFAULT attention. The image is the only change
+# vs the base recipe. avarok's Marlin GEMM path was tried and CRASHES this model (see env
+# note). After boot, VERIFY OUTPUT CORRECTNESS with a real prompt, not just /health.
+#
+# ⚠️ MTP gotcha (avarok README): "MTP requires fix_mtp_nvfp4_exclusion.py to be run inside
+# the container before serving." Our launcher clears the avarok ENTRYPOINT and runs
+# `vllm serve` directly, so avarok's own wrapper does NOT run that patch for us. This
+# natfii quant already keeps mtp.* in bf16 (excluded from NVFP4), so it MAY be unaffected
+# — but on first boot CHECK the MTP acceptance rate in the logs. If it's ~0%, spec decoding
+# is broken and the patch is needed (or drop --speculative_config to run without MTP).
+
+# Clean (non-abliterated) NVFP4 quant with vision tower AND MTP head both preserved in bf16.
+model: natfii/Qwen3.6-27B-VLM-NVFP4-MTP
+
+# Pulled from Docker Hub (ARM64 / GB10). NOT built by build-and-copy.sh — no build_args.
+# Ensure it is pulled locally before launch: docker pull avarok/dgx-vllm-nvfp4-kernel:latest
+container: avarok/dgx-vllm-nvfp4-kernel:latest
+
+# Solo placement (one Spark). Dense-hybrid (Gated DeltaNet + 16/64 full-attention layers) => TP=1.
+solo_only: true
+
+# ABSOLUTE memory budget — UNCHANGED from the base recipe (do not touch).
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  kv_cache_memory_bytes: 25769803776   # 24 * 1024^3
+  gpu_memory_utilization: 0.48
+  max_model_len: 262144
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+  num_speculative_tokens: 2            # left at proven value; bump to 4 only after backend swap verified.
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's CUDA-graph memory ESTIMATOR is buggy on this build (reports negative GiB).
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  # Use exactly the on-disk revision; never contact HF / auto-download.
+  HF_HUB_OFFLINE: "1"
+  # NOTE: avarok's Marlin path (VLLM_NVFP4_GEMM_BACKEND=marlin + VLLM_TEST_FORCE_FP8_MARLIN=1
+  # + VLLM_USE_FLASHINFER_MOE_FP4=0) CRASHES this model at load:
+  #   "size_n = 96 is not divisible by tile_n_size = 64"
+  # Marlin requires every weight N-dim % 64 == 0; this natfii 27B has a 96-wide dim.
+  # avarok validated Marlin on Qwen3-Next-80B (Marlin-friendly shapes), not this quant.
+  # So we DROP the Marlin forcing and use vLLM's default NVFP4 backend — the same path the
+  # base tf5 recipe boots on. (Re-add the vars only for a model with Marlin-compatible shapes.)
+
+# Command == the proven base recipe, verbatim, so the ONLY variable vs base is the image.
+# Layer avarok optimizations back one at a time AFTER this boots clean + is benchmarked:
+#   - --attention-backend flashinfer  (risky: 27B is dense-HYBRID w/ Gated DeltaNet; the
+#     default auto-selects per-layer. Test carefully.)
+#   - Marlin GEMM env vars  (won't work here — 96-wide dim, see env note above)
+# avarok recommends --no-enable-chunked-prefill, but that needs max_num_batched_tokens >=
+# max_model_len; our 4096 batch vs 256k context REQUIRES chunked prefill ON.
+command: |
+  vllm serve natfii/Qwen3.6-27B-VLM-NVFP4-MTP \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --no-async-scheduling \
+    --limit-mm-per-prompt '{{"image":4,"video":0}}' \
+    --speculative_config '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
