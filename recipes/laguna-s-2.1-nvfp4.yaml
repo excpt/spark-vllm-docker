@@ -1,0 +1,77 @@
+recipe_version: "1"
+name: Laguna-S-2.1-NVFP4
+description: poolside Laguna-S-2.1 (117.6B-A8.5B MoE) NVFP4 + DFlash speculative decoding. Thinking NOT enforced. Single Spark TP=1, solo.
+
+# poolside code model. From the model card:
+#   architectures: MoE, 256 experts (+1 shared), 48 layers (12 global-attn / 36 SWA)
+#   117.6B total / 8.5B active, 262k context, hf_quant NVFP4.
+# Speculative decoding via the DFlash draft head (poolside/Laguna-S-2.1-DFlash-NVFP4,
+# ~1B BF16, ~2GB) with method "dflash". Card reports 2.9-3.1 accepted tokens/step on Spark.
+# Needs vLLM >= 0.25.1 for the poolside_v1 tool-call + reasoning parsers (present in the
+# vllm-node image built from latest main). FIRST START ~15 min (JIT compilation).
+model: poolside/Laguna-S-2.1-NVFP4
+
+container: vllm-node-tf5
+
+# The model's HF-bundled chat template is stale: it gates the generation <think> OFF
+# whenever a system message OR tools are present, so Laguna can't reason with a system
+# prompt or model-driven web_search. This mod ships the corrected template (generation
+# <think> keyed on enable_thinking alone) and serves it via --chat-template below.
+mods:
+  - mods/fix-laguna-chat-template
+
+# Solo placement (one Spark). ~71GB NVFP4 weights + ~2GB draft => nearly fills the node;
+# TP=1, no room for co-tenants. Do NOT co-schedule other models on the same node.
+solo_only: true
+
+# MEMORY: HARD byte-cap, NOT the poolside-card fraction. On the 120GB UNIFIED node a
+# fractional --gpu-memory-utilization 0.90 tells vLLM to size its footprint to ~108GB and
+# STARVE the OS -> host power-cut (crashed .30 twice, 2026-07-24). Docker --memory can't
+# save it: unified/GPU mem is not cgroup-accounted on GB10. So we pin the total instead:
+# weights ~71 + draft ~2 + compiled overhead ~14 + KV 15 = ~102GB, leaving ~18GB for the OS.
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  kv_cache_dtype: fp8
+  max_model_len: 262144
+  # HARD KV byte cap (profiler-bypassed). 15 GiB (+5 GB for seqs=32 concurrency + prefix cache).
+  kv_cache_memory_bytes: 16106127360   # 15 * 1024^3
+  # Startup free-memory GATE + ceiling (KV size is pinned above). 0.88 => 105.6GB ceiling; the
+  # ~102GB footprint fits and the empty node (114GB free) clears the gate. ~18GB left for OS.
+  gpu_memory_utilization: 0.88
+  # Community GB10 fast config (NVIDIA forum): 32 seqs + 16384 batched-tokens + prefix
+  # caching hit ~40-50 tok/s. DFlash crashes at the default 256 seqs, so 32 is the ceiling.
+  max_num_seqs: 32
+  max_num_batched_tokens: 16384
+  # DFlash draft depth. 3 (was 7). Live draft-ladder telemetry: acceptance decays
+  # 50%/28%/11%/8%/3%/0%/0% across pos 0-6 — positions 4-6 accept ~0%, pure wasted draft
+  # compute (~54 tok/s discarded at depth 7). 3 keeps everything that actually lands, like
+  # the Qwen MTP-3 depth. Card's 7/15 over-draft on GB10.
+  num_speculative_tokens: 3
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's cudagraph memory estimator is buggy on this build; disabling it makes the byte cap hold.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+command: |
+  vllm serve poolside/Laguna-S-2.1-NVFP4 \
+    --host {host} --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --max-model-len {max_model_len} \
+    --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-num-seqs {max_num_seqs} \
+    --enable-chunked-prefill \
+    --enable-prefix-caching \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --moe-backend flashinfer_cutlass \
+    --speculative-config '{{"model":"poolside/Laguna-S-2.1-DFlash-NVFP4","num_speculative_tokens":{num_speculative_tokens},"method":"dflash"}}' \
+    --tool-call-parser poolside_v1 \
+    --reasoning-parser poolside_v1 \
+    --enable-auto-tool-choice \
+    --chat-template fixed_chat_template.jinja \
+    --override-generation-config '{{"temperature": 0.7, "top_p": 0.95, "top_k": 20}}' \
+    --trust-remote-code

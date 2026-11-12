@@ -1,0 +1,63 @@
+recipe_version: "1"
+name: Ornith-1.0-35B-NVFP4
+description: Ornith-1.0-35B (DeepReinforce self-scaffolding agentic coder) NVFP4 W4A4, VISION ENABLED, reasoning. Single Spark TP=1.
+
+# NVFP4 (W4A4, group 16) quant of deepreinforce-ai/Ornith-1.0-35B via llm-compressor.
+# Arch: qwen3_5_moe MoE (256 routed experts x 3 x 40 layers, pack-quantized) + Qwen3-VL vision tower.
+# Kept bf16: vision tower (re:.*visual.*), MoE routers (mlp.gate / mlp.shared_expert_gate), lm_head.
+# compressed-tensors nvfp4-pack-quantized => auto-detected; NO --quantization flag needed.
+# Weights ~21.9GB (from 70.3GB bf16). Reference serving used TP=2 only because the box had 16GB GPUs;
+# on a Spark's 120GB unified memory it fits comfortably solo at TP=1 (no NCCL/all-reduce workarounds).
+model: sakamakismile/Ornith-1.0-35B-NVFP4
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# Solo placement (one Spark). TP=1 => full weights on one node; no expert-parallel needed.
+solo_only: true
+
+# ABSOLUTE memory budget (unified-memory safety) — patches vLLM to accept a hard GB cap
+# instead of the fraction-of-total that starves the OS on GB10's shared 120GB and crashes the HOST.
+mods:
+  - mods/gpu-mem-util-gb
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # HARD CAP in GB (NOT a 0-1 fraction). ~45GB: quantized weights(~22) + bf16 lm_head + bf16
+  # vision tower + bf16 routers + KV. Fails safe at startup if short instead of hanging the host.
+  gpu_memory_utilization: 45
+  max_model_len: 262144
+  max_num_batched_tokens: 4096
+  max_num_seqs: 128
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # vLLM's CUDA-graph memory ESTIMATOR is buggy on this build (reports negative GiB),
+  # inflating "available KV cache" past the GB cap. Disabling it makes the cap hold.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+# Reasoning model: Ornith reasons at length. Toggle per-request with
+#   chat_template_kwargs: {"enable_thinking": true|false}
+# and give it room (max_tokens >= 6500); extract code from AFTER </think>, not the whole message.
+# No MTP head on this model => no --speculative_config (unlike the Qwen3.6 vision siblings).
+# Vision tower present => --limit-mm-per-prompt allows images; video:0 avoids the boot-profiling hang.
+command: |
+  vllm serve sakamakismile/Ornith-1.0-35B-NVFP4 \
+    --host {host} --port {port} \
+    -tp {tensor_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --max-num-seqs {max_num_seqs} \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --trust-remote-code \
+    --load-format fastsafetensors \
+    --no-async-scheduling \
+    --limit-mm-per-prompt '{{"image":4,"video":0}}'
