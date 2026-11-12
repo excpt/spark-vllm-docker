@@ -1,0 +1,178 @@
+recipe_version: "1"
+name: DeepSeek-V4-Flash-0731-NVFP4
+description: DeepSeek-V4-Flash 304B, routed experts (incl. MTP) NVFP4, rest FP8. TP=2 + EP=2 across BOTH Sparks, fp8 KV, 256k. DSpark spec decode, block size 5.
+
+# Rarri/DeepSeek-V4-Flash-0731-NVFP4 — 165 GB on disk, 48 shards, cached on .30 and .31.
+# Verified from config.json: 43 layers, 256 routed experts, num_experts_per_tok 6,
+# moe_quant_algo NVFP4 (group 16) over layers.0-42.ffn.experts + mtp.0.ffn.experts;
+# attention / shared experts / lm_head stay FP8 (quant_method fp8, ignore list).
+# dspark_block_size 5, dspark_target_layer_ids [40,41,42].
+model: Rarri/DeepSeek-V4-Flash-0731-NVFP4
+
+container: vllm-node
+build_args:
+  - --tf5
+
+# 165 GB / 2 = ~83 GB of weights PER RANK on a 120 GB unified-memory Spark.
+# This takes the whole cluster: nothing else fits alongside it. Launch with
+# `-n <head>,<worker>` FROM a fleet node (autodiscover.sh needs `ip`; macOS lacks it).
+cluster_only: true
+
+defaults:
+  port: 8008
+  host: 0.0.0.0
+  tensor_parallel: 2
+  # DO NOT enable --decode-context-parallel-size on this model. TRIED 2026-08-08, hard fail:
+  #   kv_cache_interface.py:611  assert decode_context_parallel_size == 1
+  #   AssertionError: DCP not support sliding window.
+  # DeepSeek-V4-Flash sets sliding_window=128 (config.json, part of the DSA design), and vLLM
+  # vetoes DCP for any sliding-window model in the KV-CACHE INTERFACE — regardless of the
+  # attention backend advertising supports_dcp_with_varlen. So MLA KV stays REPLICATED across
+  # ranks here: 15 GiB/rank is 15 GiB of logical pool, not 30.
+  # HARD byte cap on KV, PER RANK (profiler-bypassed). MLA keeps one latent KV head, so
+  # the cache is REPLICATED across ranks, not sharded — this is the real per-node cost.
+  # MEASURED 2026-08-08 on the first bring-up: 12 GiB gave 468,052 tokens = 26.9 KB/token
+  # (fp8 latent 576 B/layer/token x 43 layers, plus the FP8 Lightning-Indexer cache), i.e.
+  # 1.79x concurrency at 256k. 10 GiB => ~390k tokens, ~1.49x.
+  # WHY 10 AND NOT 12: that first run DIED. Weights settled at 96 GB used (23 avail), the
+  # 12 GiB KV alloc took it to 106 (13 avail), and then the flashinfer/trtllm MoE autotuner
+  # + TileLang JIT workspaces pushed peak to 11 GiB avail — under earlyoom's floor, which
+  # SIGTERMed vLLM mid-capture. The tail of startup, NOT the weights, is what overruns.
+  # Budget ~10 GB of transient autotune/capture workspace ON TOP of weights + KV.
+  # To get the 468k tokens back at 6 GiB/rank, use DCP instead of raising this — see below.
+  # 10 GiB for the DSPARK variant (the -nospec/-mtp3 recipes run 15). DSpark does NOT fit at
+  # 15: measured 2026-08-08, the speculator captures its OWN CUDA graphs (2.71 GiB rank0 +
+  # 1.39 GiB rank1) and holds draft state on top of 81.7 weights + 15 KV + ~10 autotune.
+  # earlyoom SIGTERMed it 4x on .30 and SIGKILLed rank 1 right after "Graph capturing
+  # finished". Decode SPEED does not depend on pool size, so 10 GiB (390k tokens) still gives
+  # a valid throughput comparison against the 15 GiB no-spec baseline.
+  kv_cache_memory_bytes: 10737418240   # 10 * 1024^3
+  # Startup free-memory GATE, not a bound on unified memory (the byte cap above is what
+  # holds). 0.85 => vLLM demands 101.7 of 119.63 GiB FREE at init; footprint is ~92 GB
+  # (82 weights + 10 KV), so the gate still clears it with room.
+  # WHY NOT 0.90: it demands 107.67 GiB free and a RESTART fails it. vLLM checks CUDA's
+  # FREE memory, not MemAvailable — and after one run, this model's own 165 GB read leaves
+  # tens of GB of page cache, which is available-but-not-free. Second launch on 2026-08-08
+  # died at "Free memory on device cuda:0 (107.02/119.63 GiB) ... less than desired GPU
+  # memory utilization (0.9, 107.67 GiB)" — short by 0.65 GiB of pure page cache.
+  # The gate must tolerate a warm page cache or the recipe is only launchable on a cold box.
+  # This model needs BOTH Sparks to itself — see spark.yaml, the two Qwen clusters come
+  # down first.
+  # 0.88 (was 0.85): the gate must stay above the footprint, and KV just grew to 15 GiB
+  # (81.7 weights + 15 KV = ~97 GiB). 0.88 => demands 105.3 of 119.63 GiB free at init;
+  # both nodes sit at 110-114 GiB free after a page-cache drop, so it clears with ~5 GiB.
+  gpu_memory_utilization: 0.88
+  # 256k. Model supports 1M (yarn factor 16 over 65536); the checkpoint author benchmarked
+  # 131k. At the measured 26.9 KB/token a single full-length request costs ~6.7 GiB of the
+  # 10 GiB pool, so 256k is the floor for this cap — do not raise max_model_len without
+  # raising KV, or vLLM will refuse to admit one full-context request.
+  max_model_len: 262144
+  # 32768 (was 8192). Prefill is COMPUTE-bound and was starved: measured 2,577-4,046 tok/s
+  # single-request and only 1,623 aggregate with 3x150k concurrent (concurrency made it WORSE
+  # — they queue for one shared budget rather than adding to it). At 8192 with TP=2 + EP=2 each
+  # expert GEMM sees only ~190 rows; Blackwell tensor cores want thousands. 32768 => ~760 rows
+  # and slices a 150k prompt into 5 steps instead of 19. The 27B recipe measured 1,232 -> 4,106
+  # tok/s for the same 8192->16384 move on this hardware.
+  # COST: each step is longer in wall-clock, so concurrent users' decode arrives in burstier
+  # chunks (worse P99 inter-token latency), and prefill activation memory scales with this.
+  # Headroom is ~8 GiB at 15 GiB KV — if this OOMs, drop to 16384 before touching KV.
+  # 8192 — TESTED AND REVERTED FROM 16384/32768 on 2026-08-08. Do not raise on THIS model.
+  # Unlike the 27B (which measured 1,232 -> 4,106 tok/s going 8192->16384), DeepSeek-V4 has
+  # sliding-window layers, so the chunk size is charged TWICE:
+  #   1. KV RESERVATION: kv_cache_interface.py:604 holds min(sliding_window-1 + max_in_flight
+  #      _tokens, max_model_len) per sliding layer. Measured on the same 15 GiB pool:
+  #        8192  -> 546,671 KV tokens (2.09x concurrency at 256k)
+  #        16384 -> 293,319 KV tokens (1.12x)   <- 46% of the pool GONE
+  #        32768 -> engine REFUSES to start, demands 27.11 GiB
+  #   2. PREFILL ACTIVATION: at 16384 the 131k-context test drove .30 to the 2% earlyoom
+  #      floor and vLLM was SIGTERMed mid-run.
+  # And there was NO prefill payoff: 16384 measured 3,461 / 2,303 / 4,094 tok/s at 17k/65k/131k
+  # vs 2,433 / 3,184 / 3,326 at 8192 — noise, not a trend. Prefill here appears gated by the
+  # DSA indexer + MoE dispatch, not GEMM width.
+  max_num_batched_tokens: 8192
+  max_num_seqs: 16
+  block_size: 256
+  # DSpark is a semi-autoregressive BLOCK drafter: vLLM hard-errors below
+  # dspark_block_size (5) because smaller blocks garble output, not just lower
+  # acceptance. 5 is also the author's measured optimum — depth 7 is slower
+  # (positions 6-7 accept 1-10% and verify cost is paid every step).
+  # Measured: accept length 3.85/6, 49.4% cumulative draft acceptance, ~1.8x decode.
+  num_speculative_tokens: 5
+
+env:
+  # DeepGEMM JIT via the bundled compiler, not NVRTC (from the base V4-Flash recipe).
+  DG_JIT_USE_NVRTC: "0"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # CUDA-graph memory estimator is buggy on this build (reports negative GiB) and
+  # inflates "available KV cache" past the byte cap. Off => the cap holds.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+  CUTE_DSL_ARCH: "sm_121a"
+  # Fully cached locally; never let huggingface_hub do an ETag round-trip at engine init.
+  HF_HUB_OFFLINE: "1"
+
+# --speculative-config method dspark: DSpark ships its draft weights INSIDE this
+#   checkpoint (config/speculative.py:706), so no separate draft model. draft_sample_method
+#   defaults to "greedy" — which is what this NVFP4 path needs; "probabilistic" garbles
+#   output. Fixed depth is also the default (num_speculative_tokens_per_batch_size unset);
+#   do NOT enable the dynamic-depth controller, it oscillates at single-stream.
+# NOT SET, the next thing to try: --decode-context-parallel-size 2. MLA has one latent KV
+#   head, so TP cannot shard the cache and both ranks hold an identical copy. DCP shards it
+#   along the SEQUENCE instead (tp % dcp == 0, parallel.py:507), so the same token budget
+#   costs half per rank — 468k tokens at 6 GiB/rank instead of 12. Supported on this exact
+#   path: flashinfer_mla_sparse.py:292 declares supports_dcp_with_varlen and :395 filters
+#   the indexer's top-512 to rank-local blocks. Costs one small extra collective per
+#   attention layer per decode step (partial outputs + LSE, tens of KB — not KV-sized).
+# --enable-expert-parallel + --moe-backend flashinfer_cutlass: EP=2 keeps 128 WHOLE experts
+#   per rank instead of slicing every expert's 2048-wide matrices to 1024. cutlass is
+#   MANDATORY with EP on NVFP4 — flashinfer_b12x has no expert-parallel path and refuses
+#   outright ("does not support ... ep_size=2, use_ep=True"). Same pairing as the 35B EP2.
+# Text-only: config.json has no vision_config and no image/audio/video token ids, so there
+#   is nothing to limit — no --limit-mm-per-prompt, no multimodal preprocessor is built.
+# --reasoning-parser deepseek_v4, with NO --reasoning-config override. The parser is a state
+#   machine on <think>/</think> (parser/deepseek_v4.py:43-44) that STARTS in the REASONING
+#   state when thinking is on (deepseek_v4_config:128) and leaves it on </think>.
+#   The old base V4-Flash recipe passed reasoning_start_str/reasoning_end_str = "" — that
+#   breaks the transition: measured 2026-08-08, reasoning_content was ALWAYS None and any
+#   generation truncated before </think> returned a COMPLETELY EMPTY content (200-token cap
+#   -> 200 tokens billed, empty string returned). Do not re-add it.
+# SAMPLING DEFAULTS: the checkpoint's generation_config.json is bare boilerplate
+#   (temperature 1.0, top_p 1.0 = max entropy), so any client that does not set sampling gets
+#   full-entropy output — bad for code. DeepSeek's published values: chat 1.0/1.0,
+#   agentic 1.0/0.95, CODING-TUNED 0.6/0.95. The public dual-DGX-Spark deployment of this
+#   model also defaults to 0.6/0.95. We set 0.6/0.95 server-side; clients that want chattier
+#   output raise temperature per-request (a request value always wins over this default).
+# THINKING IS DISABLED BY DEFAULT — measured 2026-08-09, thinking mode returns EMPTY content.
+#   With thinking=true the model never emits </think> within any tested budget (200/400/800/
+#   1200/1600 tokens): finish_reason=length, full tokens BILLED, content="" and
+#   reasoning_content=None. A 12-user 38-turn load test returned 14 EMPTY responses, all from
+#   thinking turns. The ONLY kwarg combination that produces output is
+#   reasoning_effort="none", which per vLLM PR #50580 means "selects chat mode" — i.e. not
+#   thinking at all. So there is no working reasoning config on this build; leaving
+#   thinking=true default made every naive client get empty answers.
+#   Re-test after a vLLM bump; if </think> starts appearing, flip this back.
+# --safetensors-load-strategy prefetch: 165 GB off local disk, single-threaded otherwise.
+#   (The base V4-Flash recipe used --load-format instanttensor; untried on this quant.)
+command: |
+  vllm serve Rarri/DeepSeek-V4-Flash-0731-NVFP4 \
+      --host {host} --port {port} \
+      -tp {tensor_parallel} \
+      --enable-expert-parallel \
+      --moe-backend flashinfer_cutlass \
+      --trust-remote-code \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --block-size {block_size} \
+      --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --kv-cache-dtype fp8 \
+      --enable-prefix-caching \
+      --safetensors-load-strategy prefetch \
+      --tokenizer-mode deepseek_v4 \
+      --enable-auto-tool-choice \
+      --tool-call-parser deepseek_v4 \
+      --reasoning-parser deepseek_v4 \
+      --override-generation-config '{{"temperature":0.6,"top_p":0.95}}' \
+      --default-chat-template-kwargs.thinking=false \
+      --speculative-config '{{"method":"dspark","num_speculative_tokens":{num_speculative_tokens}}}'
