@@ -1,0 +1,48 @@
+recipe_version: "1"
+name: Qwen3-Reranker-8B
+description: Qwen3-Reranker-8B cross-encoder reranker (pooling/score). Serves /v1/score & /rerank. bf16, no KV cache.
+
+model: Qwen/Qwen3-Reranker-8B
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+solo_only: true
+
+# ABSOLUTE GB budget (unified-memory safety + composes under the 110GB node cap).
+mods:
+  - mods/gpu-mem-util-gb
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  # HARD CAP in GB (NOT a fraction). weights ~15GB + ~11GB overhead + CUDA graphs => 30GB.
+  gpu_memory_utilization: 30
+  max_model_len: 32768
+
+env:
+  # Disable the buggy CUDA-graph memory estimator so --gpu-memory-utilization-gb is honored.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+# Qwen3-Reranker requires vLLM to convert it to a sequence-classification head.
+# The two flags below are MANDATORY (per vLLM docs):
+#   --hf-overrides  : convert to Qwen3ForSequenceClassification + map yes/no tokens
+#   --chat-template : the reranker SCORING template (query/document -> yes/no).
+# NOTE: this is NOT the model's own chat_template.jinja (that's the conversational/tool
+# template). The scoring template ships in vLLM's examples (not in the pip package, not in
+# the model repo), so we staged it in the HF cache, which is mounted into the container at
+# /root/.cache/huggingface. Source: vllm examples/pooling/score/template/qwen3_reranker.jinja
+# (also kept in this repo at recipes/templates/qwen3_reranker.jinja).
+# NOTE: braces are doubled ({{ }}) because run-recipe.py runs str.format() on this command.
+# ALTERNATIVE: a pre-converted seq-cls checkpoint (e.g. *-seq-cls-vllm-fixed) needs neither
+# --hf-overrides nor --chat-template — just `--runner pooling`.
+command: |
+  vllm serve Qwen/Qwen3-Reranker-8B \
+    --host {host} --port {port} \
+    --runner pooling \
+    --hf-overrides '{{"architectures": ["Qwen3ForSequenceClassification"], "classifier_from_token": ["no", "yes"], "is_original_qwen3_reranker": true}}' \
+    --chat-template /root/.cache/huggingface/templates/qwen3_reranker.jinja \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --trust-remote-code

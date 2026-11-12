@@ -1,0 +1,40 @@
+recipe_version: "1"
+name: Qwen3-Embedding-8B
+description: Qwen3-Embedding-8B text embedder (pooling). Serves OpenAI /v1/embeddings. bf16, no KV cache.
+
+model: Qwen/Qwen3-Embedding-8B
+
+container: vllm-node-tf5
+build_args:
+  - --tf5
+
+# Embedder runs on a single node (no TP, stateless).
+solo_only: true
+
+# ABSOLUTE GB budget (unified-memory safety + composes under the 110GB node cap).
+mods:
+  - mods/gpu-mem-util-gb
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  # HARD CAP in GB (NOT a fraction). bf16 weights ~14GB + ~11GB non-torch overhead on GB10
+  # + CUDA graphs => ~27GB floor. 30GB gives margin. (A fraction of 0.20=24GB was too low ->
+  # "negative KV cache". Absolute sizing avoids that and caps the claim.)
+  gpu_memory_utilization: 30
+  max_model_len: 32768
+
+env:
+  # Disable the buggy CUDA-graph memory estimator so --gpu-memory-utilization-gb is honored.
+  VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS: "0"
+
+# --runner pooling => embeddings endpoint (/v1/embeddings).
+# MRL: callers can request a smaller embedding dim per request via the `dimensions`
+# field; no serve-time flag needed.
+command: |
+  vllm serve Qwen/Qwen3-Embedding-8B \
+    --host {host} --port {port} \
+    --runner pooling \
+    --gpu-memory-utilization-gb {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --trust-remote-code

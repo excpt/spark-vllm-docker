@@ -1,0 +1,42 @@
+name: GLM-OCR
+description: Z.ai GLM-OCR 0.9B document OCR (recognition-only endpoint). Absolute GB cap for co-tenancy.
+container: vllm-node-tf5
+build_args:
+  - --pre-tf
+
+model: zai-org/GLM-OCR
+recipe_version: 1.0.0
+
+# Absolute GB cap so the tiny OCR model can't greedy-claim a fraction of the node
+# (0.5 = ~60GB on a 120GB Spark). It only needs weights (~2.5GB) + a small KV.
+mods:
+  - mods/gpu-mem-util-gb
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 10        # HARD CAP in GB. 8 left only 1.95GiB KV (<2.0 needed at
+                                    # 32k seq) once max_num_batched_tokens hit 16384 — bigger
+                                    # prefill batch eats activation/cudagraph mem. 10 → ~4GiB KV.
+  max_model_len: 32768              # one page (image tokens + recognized text) fits easily;
+                                    # 131072 needed 8GB KV alone and busted the 8GB cap
+  max_num_batched_tokens: 4096      # prefill chunk budget. UPPER bound, not a fill threshold —
+                                    # small/single prompts still admit immediately; bigger ones
+                                    # chunk into 4k slices. Smaller batch => less activation mem.
+
+command: |
+  vllm serve zai-org/GLM-OCR \
+      --port {port} \
+      --host {host} \
+      -tp {tensor_parallel} \
+      --gpu-memory-utilization-gb {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --allowed-local-media-path / \
+      --served-model-name glm-ocr \
+      --quantization fp8 \
+      --kv-cache-dtype fp8 \
+      --limit-mm-per-prompt '{{"image":1,"video":0}}'
+      # ponytail: NO --load-format fastsafetensors — it silently kills EngineCore on
+      # single-file (non-sharded) safetensors like GLM-OCR. See memory fastsafetensors-single-file-crash.

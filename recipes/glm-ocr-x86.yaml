@@ -1,0 +1,88 @@
+name: GLM-OCR-x86
+description: Z.ai GLM-OCR 0.9B document OCR, x86 discrete-GPU variant. Stock vLLM image, fractional VRAM. Recognition-only endpoint.
+container: vllm/vllm-openai:latest
+model: zai-org/GLM-OCR
+recipe_version: 1.0.0
+
+# Stock upstream image (x86_64 + Blackwell). Pre-pull:  docker pull vllm/vllm-openai:latest
+# No mods: the tiny model is capped with the standard fractional --gpu-memory-utilization.
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  # SOLO on the 24GB card since 2026-08-09 (embed + rerank stopped) => full blast.
+  # Fraction of 24GB: 0.9B fp8 weights ~1.5GB + CUDA ctx + cudagraphs, rest is KV.
+  # 0.92 => ~22.5GiB pool, ~19GiB of it KV.
+  # KV math (fp8, from config.json): 16 layers x 8 kv-heads x 128 head-dim x 2 (K+V) x 1B
+  # = 32 KiB/token => ~19GiB pool holds ~620k tokens. A real page request is ~2-4k tokens,
+  # so 24 concurrent pages need ~0.1GiB — max_num_seqs, not KV, is the parallelism limit.
+  # (Only if every slot ran the full 32k context would 24 seqs need 24GiB.)
+  # fp8 + fp8 KV, COMPILED (no --enforce-eager: eager garbles GLM-OCR on vLLM 0.24.0).
+  # cudagraph capture scales with max_num_seqs; 32 is cheap (capture sizes are capped by it).
+  # History (co-tenant era): had to run 0.21 / max_num_seqs 8 because embed(0.44)+rerank(0.26)
+  # left ~5GiB and peak activations OOM'd. Re-tighten only if the card gets co-tenants again.
+  # NOTE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments does NOT help here — vLLM spawns the
+  # EngineCore worker with a filtered env and drops it, so it never reaches the allocator that
+  # OOMs (confirmed: set on APIServer pid, absent on EngineCore pid). Do not re-add it.
+  # 0.92 -> 0.85: the KV profiler does NOT account for the vision encoder's transient forward
+  # (see max_num_batched_tokens below) — it OOM'd at 0.92 with 595MiB free. This leaves ~3.5GiB
+  # of deliberate slack for that spike. It is NOT wasted VRAM; it is the encoder's working set.
+  gpu_memory_utilization: 0.85
+  max_model_len: 32768
+  # 64 concurrent: at ~4k tokens/page that's 256k of the ~600k-token KV pool (43%). Only an
+  # all-slots-at-full-32k worst case (2.05M tokens) overruns it — vLLM preempts + recomputes,
+  # it does not OOM. cudagraph capture cost of 32->64 is negligible (0.13 GiB at 32).
+  max_num_seqs: 64
+  # DO NOT RAISE without load-testing 64 concurrent images. This knob is NOT just the prefill
+  # budget — vllm/config/scheduler.py hard-wires  max_num_encoder_input_tokens = encoder_cache_size
+  # = max_num_batched_tokens  ("TODO: Make this configurable"), so it is ALSO the vision-encoder
+  # batch budget, and there is no separate flag.
+  # The trap: the budget counts MERGED tokens, but the vision tower runs on RAW patches, and
+  # spatial_merge_size=2 => 4 raw patches per token. So the encoder forward sees up to 4x this
+  # value in rows. gate_up_proj output alone = 4*B*8192*2B = 64 KiB * B:
+  #   B=32768 -> ~131k patch rows -> 2.0 GiB in ONE tensor -> CUDA OOM (crashed 2026-08-09,
+  #             _execute_mm_encoder -> glm4_1v.py gate_up_proj, 1.51 GiB alloc, 595 MiB free)
+  #   B=16384 -> ~65k rows -> ~1.0 GiB/tensor, ~2.5 GiB transient peak  <- current, load-tested
+  # None of this is seen by the KV memory profiler, hence the 0.85 slack above.
+  # Not a per-document limit either: --limit-mm-per-prompt image:1 means one request = one page
+  # (~1-3k tokens), so a big doc is many requests, each prefilling in a single chunk regardless.
+  max_num_batched_tokens: 16384
+
+# launch-cluster auto-detects ETH_IF on the MASTER (a Spark, iface enP7s7) and injects it as
+# GLOO/NCCL/TP_SOCKET_IFNAME — invalid on this x86 box, so gloo dies at init. Pin .33's real
+# NIC (owns 192.168.2.33) and disable IB (no InfiniBand here). recipe env => `export` in the
+# launch script, which wins over the docker -e values. NOTE: interface name is .33-specific.
+env:
+  NCCL_SOCKET_IFNAME: enp9s0f0np0
+  GLOO_SOCKET_IFNAME: enp9s0f0np0
+  TP_SOCKET_IFNAME: enp9s0f0np0
+  NCCL_IB_DISABLE: "1"
+  # Weights are already in the local hub cache. Without this, huggingface_hub still does an
+  # ETag round-trip at EngineCore init — and on 2026-07-29 that TCP connection went CLOSE_WAIT
+  # and the engine blocked on it FOREVER: no GPU allocation, 0% load, silent, indefinitely.
+  # There is no timeout on that path. Offline is the only reliable fix.
+  HF_HUB_OFFLINE: "1"
+  # NOTE: PYTORCH_CUDA_ALLOC_CONF intentionally NOT set here — vLLM strips it from the EngineCore
+  # worker (see gpu_memory_utilization comment above), so it's inert on this stack.
+
+command: |
+  vllm serve zai-org/GLM-OCR \
+      --port {port} \
+      --host {host} \
+      -tp {tensor_parallel} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --allowed-local-media-path / \
+      --served-model-name glm-ocr \
+      --quantization fp8 \
+      --kv-cache-dtype fp8 \
+      --generation-config auto \
+      --limit-mm-per-prompt '{{"image":1,"video":0}}'
+      # --generation-config auto: GLM-OCR's generation_config.json declares TWO eos tokens
+      # [59246, 59253] + do_sample:false. Without this flag vLLM ignores it, knows only the
+      # tokenizer's single primary eos, never stops on 59253 => endless repetition on real docs.
+      # ponytail: NO --load-format fastsafetensors — silently kills EngineCore on single-file
+      # safetensors like GLM-OCR. See memory fastsafetensors-single-file-crash.
